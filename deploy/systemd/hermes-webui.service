@@ -1,0 +1,18 @@
+[Unit]
+Description=Hermes Web UI
+After=network.target tailscaled.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/hermes-webui
+ExecStart=/bin/bash %h/hermes-webui/start.sh --foreground
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+Environment=HERMES_WEBUI_PRESERVE_ENV=1
+Environment=HERMES_WEBUI_HOST=100.123.208.90
+Environment=HERMES_WEBUI_PORT=8788
+
+[Install]
+WantedBy=default.target

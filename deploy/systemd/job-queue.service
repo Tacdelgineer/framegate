@@ -1,0 +1,23 @@
+[Unit]
+Description=DGX Tailscale job queue
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/alireza/content-factory/queue
+Environment=PYTHONUNBUFFERED=1
+Environment=JOB_QUEUE_DB=/home/alireza/content-factory/queue/data/jobs.sqlite3
+Environment=JOB_QUEUE_STORAGE=/home/alireza/content-factory/queue/data/files
+Environment=JOB_QUEUE_CLAIM_TIMEOUT_SECONDS=1800
+Environment=JOB_QUEUE_MAX_UPLOAD_BYTES=21474836480
+ExecStart=/home/alireza/content-factory/queue/.venv/bin/python -m uvicorn job_queue.app:app --host 100.123.208.90 --port 8787
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/home/alireza/content-factory/queue/data
+
+[Install]
+WantedBy=default.target
