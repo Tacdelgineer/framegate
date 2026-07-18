@@ -1,0 +1,14 @@
+[Unit]
+Description=Keep qwen3:8b resident in Ollama
+Requires=ollama.service
+Wants=tailscaled.service
+After=ollama.service tailscaled.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/ollama-warm-qwen3
+RemainAfterExit=yes
+TimeoutStartSec=700
+
+[Install]
+WantedBy=multi-user.target

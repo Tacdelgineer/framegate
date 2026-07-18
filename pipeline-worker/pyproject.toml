@@ -1,0 +1,14 @@
+[project]
+name = "dgx-pipeline-worker"
+version = "0.1.0"
+description = "Tailscale-only DGX Spark media worker for a remote Hermes agent"
+requires-python = ">=3.12"
+dependencies = []
+
+[tool.uv]
+package = false
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
