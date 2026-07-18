@@ -1,0 +1,28 @@
+[Unit]
+Description=DGX Hermes media pipeline worker
+Wants=network-online.target tailscaled.service docker.service ollama.service comfyui.service
+After=network-online.target tailscaled.service docker.service ollama.service comfyui.service
+
+[Service]
+Type=simple
+User=xxfactionsxx
+Group=xxfactionsxx
+SupplementaryGroups=docker
+WorkingDirectory=/home/xxfactionsxx/content-factory/worker-dgx
+EnvironmentFile=/etc/pipeline-worker.env
+ExecStartPre=/usr/bin/test -f /home/xxfactionsxx/content-factory/worker-dgx/uv.lock
+ExecStartPre=/home/xxfactionsxx/.local/bin/uv lock --check --offline
+ExecStartPre=/home/xxfactionsxx/.local/bin/uv sync --frozen --offline
+ExecStartPre=/bin/sh /home/xxfactionsxx/content-factory/worker-dgx/systemd/wait-for-comfyui.sh
+ExecStart=/home/xxfactionsxx/content-factory/worker-dgx/.venv/bin/python /home/xxfactionsxx/content-factory/worker-dgx/pipeline_worker.py
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+UMask=0027
+StateDirectory=pipeline-worker
+ReadWritePaths=/srv/ai/assets/pipeline-worker /srv/ai/outputs /var/lib/pipeline-worker
+StandardOutput=append:/var/log/pipeline-worker.log
+StandardError=append:/var/log/pipeline-worker.log
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,38 @@
+[Unit]
+Description=Headless ComfyUI API for the content-factory worker
+Wants=network-online.target docker.service
+After=network-online.target docker.service
+
+[Service]
+Type=simple
+User=xxfactionsxx
+Group=xxfactionsxx
+SupplementaryGroups=docker
+ExecStartPre=/usr/bin/test -f /home/xxfactionsxx/content-factory/worker-dgx/comfyui/extra_model_paths.yaml
+ExecStartPre=-/usr/bin/docker rm -f content-factory-comfyui
+ExecStart=/usr/bin/docker run \
+  --name content-factory-comfyui \
+  --gpus all \
+  --publish 127.0.0.1:8188:8188 \
+  --volume /srv/ai/models:/models:ro \
+  --volume /srv/ai/cache/hf:/cache/hf:rw \
+  --volume /srv/ai/outputs:/outputs:rw \
+  --volume /home/xxfactionsxx/flow88-enhancer-engine/docker-data/models:/external-models/upscale_models:ro \
+  --volume /home/xxfactionsxx/content-factory/worker-dgx/comfyui/extra_model_paths.yaml:/etc/comfyui/extra_model_paths.yaml:ro \
+  dgx-ai-stack-comfyui:latest \
+  python main.py \
+  --listen 0.0.0.0 \
+  --port 8188 \
+  --input-directory /outputs/comfyui/input \
+  --output-directory /outputs/comfyui/output \
+  --user-directory /outputs/comfyui/user \
+  --extra-model-paths-config /etc/comfyui/extra_model_paths.yaml
+ExecStop=-/usr/bin/docker stop --time 120 content-factory-comfyui
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=180
+TimeoutStopSec=150
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

@@ -26,7 +26,12 @@ from pathlib import Path
 from typing import Any
 
 LOG = logging.getLogger("pipeline-worker")
-SUPPORTED_JOBS = ("tts", "transcribe", "assemble")
+SUPPORTED_JOBS = ("tts", "transcribe", "assemble", "frame", "video")
+VISUAL_WORKFLOWS = (
+    "flux2_klein_frame_api.json",
+    "wan22_i2v_api.json",
+    "wan22_first_last_api.json",
+)
 
 
 class PipelineError(RuntimeError):
@@ -40,7 +45,6 @@ class NoJobAvailable(Exception):
 @dataclasses.dataclass(frozen=True)
 class Config:
     jobs_url: str
-    upload_url: str
     worker_id: str
     poll_interval: float
     request_timeout: float
@@ -58,6 +62,12 @@ class Config:
     f5tts_container: str
     whisper_container: str
     ollama_url: str
+    comfyui_url: str
+    comfyui_timeout: float
+    comfyui_input_dir: Path
+    comfyui_output_dir: Path
+    comfyui_workflow_dir: Path
+    visual_min_available_gb: float
     default_ref_audio: str
     default_ref_text: str
 
@@ -66,12 +76,9 @@ class Config:
         jobs_url = os.getenv(
             "PIPELINE_JOBS_URL", "http://VPS_TAILSCALE_IP:8787/jobs"
         ).rstrip("/")
-        api_root = jobs_url.removesuffix("/jobs")
-        upload_url = os.getenv("PIPELINE_UPLOAD_URL", f"{api_root}/files").rstrip("/")
         hostname = socket.gethostname().split(".", 1)[0]
         config = cls(
             jobs_url=jobs_url,
-            upload_url=upload_url,
             worker_id=os.getenv("PIPELINE_WORKER_ID", f"{hostname}-dgx"),
             poll_interval=float(os.getenv("PIPELINE_POLL_INTERVAL", "5")),
             request_timeout=float(os.getenv("PIPELINE_HTTP_TIMEOUT", "30")),
@@ -107,6 +114,29 @@ class Config:
             ollama_url=os.getenv(
                 "OLLAMA_BASE_URL", "http://100.103.129.82:11434"
             ).rstrip("/"),
+            comfyui_url=os.getenv(
+                "COMFYUI_URL", "http://127.0.0.1:8188"
+            ).rstrip("/"),
+            comfyui_timeout=float(os.getenv("COMFYUI_TIMEOUT", "3600")),
+            comfyui_input_dir=Path(
+                os.getenv(
+                    "COMFYUI_INPUT_DIR", "/srv/ai/outputs/comfyui/input"
+                )
+            ),
+            comfyui_output_dir=Path(
+                os.getenv(
+                    "COMFYUI_OUTPUT_DIR", "/srv/ai/outputs/comfyui/output"
+                )
+            ),
+            comfyui_workflow_dir=Path(
+                os.getenv(
+                    "COMFYUI_WORKFLOW_DIR",
+                    str(Path(__file__).resolve().parent / "workflows"),
+                )
+            ),
+            visual_min_available_gb=float(
+                os.getenv("VISUAL_MIN_AVAILABLE_GB", "40")
+            ),
             default_ref_audio=os.getenv(
                 "F5TTS_DEFAULT_REF_AUDIO",
                 (
@@ -141,6 +171,17 @@ class Config:
             raise PipelineError("PIPELINE_JOBS_URL must use http:// or https://")
         if not parsed.path.endswith("/jobs"):
             raise PipelineError("PIPELINE_JOBS_URL must end in /jobs")
+        comfyui = urllib.parse.urlparse(self.comfyui_url)
+        if comfyui.scheme != "http" or comfyui.hostname not in {
+            "127.0.0.1",
+            "localhost",
+            "::1",
+        }:
+            raise PipelineError("COMFYUI_URL must be a loopback http:// URL")
+        if self.comfyui_timeout <= 0:
+            raise PipelineError("COMFYUI_TIMEOUT must be positive")
+        if self.visual_min_available_gb <= 0:
+            raise PipelineError("VISUAL_MIN_AVAILABLE_GB must be positive")
 
     @property
     def configured(self) -> bool:
@@ -245,61 +286,48 @@ class QueueClient:
         self.config = config
 
     def claim(self) -> dict[str, Any]:
-        claim_url = f"{self.config.jobs_url}/claim"
-        payload = {
-            "worker_id": self.config.worker_id,
-            "capabilities": list(SUPPORTED_JOBS),
-            "max_jobs": 1,
-        }
-        try:
-            status, body = json_request(
-                "POST",
-                claim_url,
-                payload,
-                timeout=self.config.request_timeout,
-            )
-        except PipelineError as exc:
-            if "HTTP 404:" not in str(exc) and "HTTP 405:" not in str(exc):
-                raise
-            query = urllib.parse.urlencode(
-                {
-                    "claim": "1",
-                    "worker_id": self.config.worker_id,
-                    "types": ",".join(SUPPORTED_JOBS),
-                }
-            )
-            status, body = json_request(
-                "GET",
-                f"{self.config.jobs_url}?{query}",
-                timeout=self.config.request_timeout,
-            )
-        if status == http.client.NO_CONTENT or body in (None, {}, []):
+        query = urllib.parse.urlencode({"status": "pending", "limit": 100})
+        _, body = json_request(
+            "GET",
+            f"{self.config.jobs_url}?{query}",
+            timeout=self.config.request_timeout,
+        )
+        if body in (None, {}, []):
             raise NoJobAvailable
-        if isinstance(body, dict) and "queue_depth" in body:
+        if not isinstance(body, list):
+            raise PipelineError("Pending-jobs response was not a list")
+        for pending in body:
+            if not isinstance(pending, dict):
+                continue
+            job_type = str(pending.get("type") or pending.get("job_type") or "").lower()
+            if job_type not in SUPPORTED_JOBS:
+                continue
+            job_id = pending.get("id") or pending.get("job_id")
+            if not job_id:
+                continue
             try:
-                queue_depth = int(body["queue_depth"])
-            except (TypeError, ValueError):
-                queue_depth = None
-            if queue_depth is not None:
-                # Stored by Worker after claim parsing.
-                body.setdefault("_queue_depth", queue_depth)
-        job = body.get("job") if isinstance(body, dict) and "job" in body else body
-        if isinstance(job, list):
-            if not job:
-                raise NoJobAvailable
-            job = job[0]
-        if not isinstance(job, dict):
-            raise PipelineError("Claim response did not contain a job object")
-        if not (job.get("id") or job.get("job_id")):
-            raise PipelineError("Claimed job is missing id/job_id")
-        if not job.get("type"):
-            raise PipelineError("Claimed job is missing type")
-        return job
+                _, claimed = json_request(
+                    "POST",
+                    (
+                        f"{self.config.jobs_url}/"
+                        f"{urllib.parse.quote(str(job_id))}/claim"
+                    ),
+                    {"worker_id": self.config.worker_id},
+                    timeout=self.config.request_timeout,
+                )
+            except PipelineError as exc:
+                if "HTTP 409:" in str(exc):
+                    continue
+                raise
+            if not isinstance(claimed, dict) or not claimed.get("claim_token"):
+                raise PipelineError("Claim response is missing claim_token")
+            return claimed
+        raise NoJobAvailable
 
     def queue_depth(self) -> int | None:
         candidates = (
+            f"{self.config.jobs_url.removesuffix('/jobs')}/health",
             f"{self.config.jobs_url}/stats",
-            f"{self.config.jobs_url}?{urllib.parse.urlencode({'view': 'stats'})}",
         )
         for url in candidates:
             try:
@@ -325,56 +353,21 @@ class QueueClient:
                     return int(source[key])
                 except (KeyError, TypeError, ValueError):
                     pass
+            try:
+                return int(source["pending_jobs"])
+            except (KeyError, TypeError, ValueError):
+                pass
         return None
-
-    def upload(self, job_id: str, path: Path, metadata: dict[str, Any]) -> dict[str, Any]:
-        args = [
-            self.config.curl_bin,
-            "--fail-with-body",
-            "--silent",
-            "--show-error",
-            "--max-time",
-            str(int(self.config.inference_timeout)),
-            "--request",
-            "POST",
-            "--form",
-            f"file=@{path}",
-            "--form",
-            f"job_id={job_id}",
-            "--form",
-            f"metadata={json.dumps(metadata, separators=(',', ':'))}",
-            self.config.upload_url,
-        ]
-        result = run_command(args, timeout=self.config.inference_timeout + 10)
-        try:
-            body = json.loads(result.stdout) if result.stdout.strip() else {}
-        except json.JSONDecodeError as exc:
-            raise PipelineError("Upload endpoint returned non-JSON data") from exc
-        if not isinstance(body, dict):
-            raise PipelineError("Upload endpoint returned an invalid response")
-        return body
 
     def complete(
         self,
         job_id: str,
         artifact: Path,
         result: dict[str, Any],
+        claim_token: str,
     ) -> None:
         complete_url = f"{self.config.jobs_url}/{urllib.parse.quote(job_id)}/complete"
-        try:
-            upload = self.upload(job_id, artifact, result)
-            json_request(
-                "POST",
-                complete_url,
-                {"worker_id": self.config.worker_id, "result": result, "artifact": upload},
-                timeout=self.config.request_timeout,
-            )
-            return
-        except PipelineError as upload_exc:
-            LOG.warning(
-                "Separate upload failed; trying multipart completion: %s",
-                compact_error(upload_exc),
-            )
+        media_type = str(result.get("media_type") or "application/octet-stream")
         args = [
             self.config.curl_bin,
             "--fail-with-body",
@@ -385,25 +378,34 @@ class QueueClient:
             "--request",
             "POST",
             "--form",
-            f"file=@{artifact}",
+            f"file=@{artifact};type={media_type}",
             "--form",
-            f"worker_id={self.config.worker_id}",
+            f"claim_token={claim_token}",
+            "--form",
+            "status=done",
             "--form",
             f"result={json.dumps(result, separators=(',', ':'))}",
             complete_url,
         ]
         run_command(args, timeout=self.config.inference_timeout + 10)
 
-    def fail(self, job_id: str, error: str, attempts: int) -> None:
-        url = f"{self.config.jobs_url}/{urllib.parse.quote(job_id)}/fail"
+    def fail(
+        self,
+        job_id: str,
+        error: str,
+        attempts: int,
+        claim_token: str,
+    ) -> None:
+        url = f"{self.config.jobs_url}/{urllib.parse.quote(job_id)}/complete"
         json_request(
             "POST",
             url,
             {
-                "worker_id": self.config.worker_id,
+                "claim_token": claim_token,
+                "status": "failed",
                 "error": error,
                 "attempts": attempts,
-                "retryable": False,
+                "result": {"worker_attempts": attempts},
             },
             timeout=self.config.request_timeout,
         )
@@ -480,24 +482,233 @@ class DockerService:
             }
 
 
+class ComfyUIClient:
+    def __init__(self, config: Config) -> None:
+        self.config = config
+
+    def probe(self) -> dict[str, Any]:
+        try:
+            _, body = json_request(
+                "GET",
+                f"{self.config.comfyui_url}/system_stats",
+                timeout=2,
+            )
+        except PipelineError as exc:
+            return {"ready": False, "error": compact_error(exc, 300)}
+        system = body.get("system", {}) if isinstance(body, dict) else {}
+        return {
+            "ready": True,
+            "url": self.config.comfyui_url,
+            "version": system.get("comfyui_version"),
+        }
+
+    def load_workflow(self, filename: str) -> dict[str, Any]:
+        if filename not in VISUAL_WORKFLOWS:
+            raise PipelineError(f"Visual workflow is not allowlisted: {filename}")
+        workflow_root = self.config.comfyui_workflow_dir.resolve()
+        path = (workflow_root / filename).resolve()
+        if workflow_root not in path.parents or not path.is_file():
+            raise PipelineError(f"Visual workflow is missing: {path}")
+        try:
+            graph = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise PipelineError(f"Cannot load visual workflow {filename}: {exc}") from exc
+        if not isinstance(graph, dict) or not graph:
+            raise PipelineError(f"Visual workflow is not an API prompt graph: {filename}")
+        for node_id, node in graph.items():
+            if not isinstance(node, dict) or not node.get("class_type"):
+                raise PipelineError(
+                    f"Visual workflow {filename} has invalid node {node_id}"
+                )
+            if not isinstance(node.get("inputs"), dict):
+                raise PipelineError(
+                    f"Visual workflow {filename} node {node_id} has invalid inputs"
+                )
+        return graph
+
+    def run(
+        self,
+        graph: dict[str, Any],
+        *,
+        expected_suffixes: tuple[str, ...],
+    ) -> tuple[Path, str]:
+        _, response = json_request(
+            "POST",
+            f"{self.config.comfyui_url}/prompt",
+            {"prompt": graph, "client_id": str(uuid.uuid4())},
+            timeout=self.config.request_timeout,
+        )
+        if not isinstance(response, dict) or not response.get("prompt_id"):
+            detail = response.get("node_errors") if isinstance(response, dict) else response
+            raise PipelineError(f"ComfyUI rejected the workflow: {detail}")
+        prompt_id = str(response["prompt_id"])
+        deadline = time.monotonic() + self.config.comfyui_timeout
+        while time.monotonic() < deadline:
+            _, history = json_request(
+                "GET",
+                f"{self.config.comfyui_url}/history/{urllib.parse.quote(prompt_id)}",
+                timeout=self.config.request_timeout,
+            )
+            record = history.get(prompt_id) if isinstance(history, dict) else None
+            if isinstance(record, dict):
+                outputs = record.get("outputs")
+                if isinstance(outputs, dict) and outputs:
+                    artifact = self._artifact_from_outputs(
+                        outputs, expected_suffixes=expected_suffixes
+                    )
+                    return artifact, prompt_id
+                status = record.get("status")
+                if isinstance(status, dict) and status.get("completed"):
+                    raise PipelineError(
+                        "ComfyUI completed without the expected output: "
+                        f"{self._status_error(status)}"
+                    )
+            time.sleep(2)
+        raise PipelineError(
+            f"ComfyUI prompt {prompt_id} timed out after "
+            f"{self.config.comfyui_timeout:.0f}s"
+        )
+
+    def _artifact_from_outputs(
+        self,
+        outputs: dict[str, Any],
+        *,
+        expected_suffixes: tuple[str, ...],
+    ) -> Path:
+        candidates: list[dict[str, Any]] = []
+
+        def collect(value: Any) -> None:
+            if isinstance(value, dict):
+                if isinstance(value.get("filename"), str):
+                    candidates.append(value)
+                for nested in value.values():
+                    collect(nested)
+            elif isinstance(value, list):
+                for nested in value:
+                    collect(nested)
+
+        collect(outputs)
+        root = self.config.comfyui_output_dir.resolve()
+        for candidate in reversed(candidates):
+            if str(candidate.get("type") or "output") != "output":
+                continue
+            filename = str(candidate["filename"])
+            subfolder = str(candidate.get("subfolder") or "")
+            path = (root / subfolder / filename).resolve()
+            if path != root and root not in path.parents:
+                continue
+            if path.suffix.lower() not in expected_suffixes:
+                continue
+            if path.is_file():
+                return path
+        raise PipelineError(
+            "ComfyUI history did not reference an existing "
+            f"{'/'.join(expected_suffixes)} artifact"
+        )
+
+    @staticmethod
+    def _status_error(status: dict[str, Any]) -> str:
+        messages = status.get("messages")
+        if isinstance(messages, list):
+            for message in reversed(messages):
+                if (
+                    isinstance(message, list)
+                    and len(message) > 1
+                    and isinstance(message[1], dict)
+                ):
+                    detail = message[1].get("exception_message")
+                    if detail:
+                        return str(detail)
+                if isinstance(message, str):
+                    return message
+        return str(status.get("status_str") or "no output metadata")
+
+
 class JobProcessor:
     def __init__(self, config: Config) -> None:
         self.config = config
         self.f5tts = DockerService(config, config.f5tts_container)
         self.whisper = DockerService(config, config.whisper_container)
+        self.comfyui = ComfyUIClient(config)
 
     def process(self, job: dict[str, Any], work_dir: Path) -> tuple[Path, dict[str, Any]]:
         job_type = str(job["type"]).lower()
         payload = job.get("payload") or job.get("input") or {}
         if not isinstance(payload, dict):
             raise PipelineError("Job payload/input must be an object")
+        payload = dict(payload)
+        self._inject_queue_inputs(job_type, payload, job.get("input_files"))
         if job_type == "tts":
             return self.tts(payload, work_dir)
         if job_type == "transcribe":
             return self.transcribe(payload, work_dir)
         if job_type == "assemble":
             return self.assemble(payload, work_dir)
+        if job_type == "frame":
+            return self.frame(payload, work_dir)
+        if job_type == "video":
+            return self.video(payload, work_dir)
         raise PipelineError(f"Unsupported job type: {job_type}")
+
+    @staticmethod
+    def _inject_queue_inputs(
+        job_type: str,
+        payload: dict[str, Any],
+        input_files: Any,
+    ) -> None:
+        if not isinstance(input_files, list):
+            return
+        by_role: dict[str, str] = {}
+        for item in input_files:
+            if not isinstance(item, dict):
+                continue
+            role = str(item.get("role") or "")
+            url = item.get("download_url") or item.get("url")
+            if role and isinstance(url, str) and url:
+                by_role[role] = url
+
+        if job_type == "video" and not any(
+            payload.get(key) is not None
+            for key in (
+                "frame",
+                "frames",
+                "frame_url",
+                "start_frame",
+                "start_frame_url",
+            )
+        ):
+            start = (
+                by_role.get("start_frame")
+                or by_role.get("frame")
+                or by_role.get("start")
+            )
+            end = by_role.get("end_frame") or by_role.get("end")
+            if start:
+                payload["frames"] = [start, end] if end else [start]
+        elif job_type == "transcribe" and not (
+            payload.get("audio_url") or payload.get("url")
+        ):
+            if by_role.get("audio"):
+                payload["audio_url"] = by_role["audio"]
+        elif job_type == "assemble":
+            if not (payload.get("voiceover_url") or payload.get("vo_url")):
+                if by_role.get("voiceover"):
+                    payload["voiceover_url"] = by_role["voiceover"]
+            if not (payload.get("clips") or payload.get("clip_urls")):
+                clips = [
+                    url
+                    for role, url in sorted(by_role.items())
+                    if role.startswith("clip")
+                ]
+                if clips:
+                    payload["clips"] = clips
+            if not payload.get("captions_url") and by_role.get("captions"):
+                payload["captions_url"] = by_role["captions"]
+        elif job_type == "tts" and not (
+            payload.get("ref_audio_url") or payload.get("ref_audio_path")
+        ):
+            if by_role.get("ref_audio"):
+                payload["ref_audio_url"] = by_role["ref_audio"]
 
     def download(self, url: str, destination: Path) -> Path:
         parsed = urllib.parse.urlparse(url)
@@ -542,6 +753,249 @@ class JobProcessor:
             raise PipelineError(f"F5 reference must be under {asset_root}")
         relative = resolved.relative_to(asset_root)
         return str(Path("/app/data/assets") / relative)
+
+    @staticmethod
+    def _prompt(payload: dict[str, Any], job_type: str) -> str:
+        prompt = str(payload.get("prompt") or "").strip()
+        if not prompt:
+            raise PipelineError(f"{job_type} payload requires a non-empty prompt")
+        if len(prompt) > 20_000:
+            raise PipelineError(f"{job_type} prompt exceeds 20,000 characters")
+        return prompt
+
+    @staticmethod
+    def _seed(payload: dict[str, Any]) -> int:
+        raw = payload.get("seed")
+        if raw is None:
+            return uuid.uuid4().int & ((1 << 63) - 1)
+        if isinstance(raw, bool):
+            raise PipelineError("seed must be an integer")
+        try:
+            seed = int(raw)
+        except (TypeError, ValueError) as exc:
+            raise PipelineError("seed must be an integer") from exc
+        if not 0 <= seed <= 18_446_744_073_709_551_615:
+            raise PipelineError("seed is outside the unsigned 64-bit range")
+        return seed
+
+    def _require_visual_headroom(self) -> float:
+        try:
+            for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
+                if line.startswith("MemAvailable:"):
+                    available_gb = int(line.split()[1]) / 1024**2
+                    break
+            else:
+                raise ValueError("MemAvailable is missing")
+        except (OSError, ValueError, IndexError) as exc:
+            raise PipelineError(f"Cannot read UMA memory headroom: {exc}") from exc
+        minimum = self.config.visual_min_available_gb
+        if available_gb < minimum:
+            raise PipelineError(
+                f"Visual job requires {minimum:.1f} GiB MemAvailable; "
+                f"only {available_gb:.1f} GiB is available"
+            )
+        return round(available_gb, 2)
+
+    @staticmethod
+    def _frame_url(value: Any, label: str) -> str:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        if isinstance(value, dict):
+            for key in ("url", "download_url", "file_url"):
+                nested = value.get(key)
+                if isinstance(nested, str) and nested.strip():
+                    return nested.strip()
+            for key in ("artifact", "file"):
+                nested = value.get(key)
+                if isinstance(nested, dict):
+                    try:
+                        return JobProcessor._frame_url(nested, label)
+                    except PipelineError:
+                        pass
+        raise PipelineError(f"{label} must be an http(s) URL or file object")
+
+    @classmethod
+    def _video_frame_urls(cls, payload: dict[str, Any]) -> list[str]:
+        plural = payload.get("frames")
+        singular = payload.get("frame")
+        if plural is not None and singular is not None:
+            raise PipelineError("video payload cannot contain both frame and frames")
+
+        raw_frames: list[Any]
+        if plural is not None:
+            if not isinstance(plural, list):
+                raise PipelineError("video frames must be a list of one or two URLs")
+            raw_frames = plural
+        elif singular is not None:
+            raw_frames = singular if isinstance(singular, list) else [singular]
+        else:
+            start_values = [
+                payload[key]
+                for key in ("start_frame", "start_frame_url", "frame_url")
+                if payload.get(key) is not None
+            ]
+            if len(start_values) > 1:
+                raise PipelineError("video payload has multiple start-frame aliases")
+            raw_frames = start_values
+
+        end_values = [
+            payload[key]
+            for key in ("end_frame", "end_frame_url")
+            if payload.get(key) is not None
+        ]
+        if len(end_values) > 1:
+            raise PipelineError("video payload has multiple end-frame aliases")
+        if end_values:
+            if len(raw_frames) != 1:
+                raise PipelineError(
+                    "end_frame/end_frame_url requires exactly one start frame"
+                )
+            raw_frames.append(end_values[0])
+
+        if len(raw_frames) not in {1, 2}:
+            raise PipelineError("video payload requires exactly one or two input frames")
+        return [
+            cls._frame_url(value, f"video frame {index}")
+            for index, value in enumerate(raw_frames, 1)
+        ]
+
+    def _stage_comfy_frame(
+        self,
+        url: str,
+        work_dir: Path,
+        label: str,
+    ) -> tuple[Path, str]:
+        suffix = Path(urllib.parse.urlparse(url).path).suffix.lower()
+        if suffix not in {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff"}:
+            suffix = ".png"
+        downloaded = self.download(url, work_dir / f"{label}{suffix}")
+        self.config.comfyui_input_dir.mkdir(parents=True, exist_ok=True)
+        staged_name = f"content-factory-{uuid.uuid4().hex}{suffix}"
+        staged = self.config.comfyui_input_dir / staged_name
+        try:
+            shutil.copy2(downloaded, staged)
+        except OSError as exc:
+            raise PipelineError(f"Cannot stage ComfyUI input frame: {exc}") from exc
+        return staged, staged_name
+
+    def frame(
+        self, payload: dict[str, Any], work_dir: Path
+    ) -> tuple[Path, dict[str, Any]]:
+        prompt = self._prompt(payload, "frame")
+        aspect = str(payload.get("aspect") or "9:16")
+        if aspect != "9:16":
+            raise PipelineError("frame currently supports only aspect='9:16'")
+        available_gb = self._require_visual_headroom()
+        seed = self._seed(payload)
+        graph = self.comfyui.load_workflow("flux2_klein_frame_api.json")
+        graph["3"]["inputs"]["text"] = prompt
+        graph["7"]["inputs"]["noise_seed"] = seed
+        graph["16"]["inputs"]["filename_prefix"] = (
+            f"content-factory/frame-{uuid.uuid4().hex}"
+        )
+        started = time.monotonic()
+        output, prompt_id = self.comfyui.run(
+            graph, expected_suffixes=(".png", ".jpg", ".jpeg", ".webp")
+        )
+        processing_time = round(time.monotonic() - started, 3)
+        width, height = self._dimensions(output)
+        if (width, height) != (1080, 1920):
+            raise PipelineError(
+                f"frame workflow returned {width}x{height}; expected 1080x1920"
+            )
+        return output, {
+            "type": "frame",
+            "media_type": "image/png",
+            "filename": output.name,
+            "width": width,
+            "height": height,
+            "aspect": aspect,
+            "model": "FLUX.2-klein-4b-fp8",
+            "seed": seed,
+            "comfyui_prompt_id": prompt_id,
+            "processing_time": processing_time,
+            "mem_available_gb_at_start": available_gb,
+        }
+
+    def video(
+        self, payload: dict[str, Any], work_dir: Path
+    ) -> tuple[Path, dict[str, Any]]:
+        prompt = self._prompt(payload, "video")
+        aspect = str(payload.get("aspect") or "9:16")
+        if aspect != "9:16":
+            raise PipelineError("video currently supports only aspect='9:16'")
+        try:
+            seconds = float(payload.get("seconds", 5))
+        except (TypeError, ValueError) as exc:
+            raise PipelineError("video seconds must be a number") from exc
+        if not 1 <= seconds <= 10:
+            raise PipelineError("video seconds must be between 1 and 10")
+        frame_urls = self._video_frame_urls(payload)
+        available_gb = self._require_visual_headroom()
+        seed = self._seed(payload)
+        fps = 16
+        frame_count = round(seconds * fps / 4) * 4 + 1
+        nominal_seconds = frame_count / fps
+        first_last = len(frame_urls) == 2
+        workflow_name = (
+            "wan22_first_last_api.json" if first_last else "wan22_i2v_api.json"
+        )
+        graph = self.comfyui.load_workflow(workflow_name)
+        staged: list[Path] = []
+        try:
+            start_path, start_name = self._stage_comfy_frame(
+                frame_urls[0], work_dir, "start-frame"
+            )
+            staged.append(start_path)
+            graph["2"]["inputs"]["text"] = prompt
+            if first_last:
+                end_path, end_name = self._stage_comfy_frame(
+                    frame_urls[1], work_dir, "end-frame"
+                )
+                staged.append(end_path)
+                graph["5"]["inputs"]["image"] = start_name
+                graph["6"]["inputs"]["image"] = end_name
+                graph["7"]["inputs"]["length"] = frame_count
+                graph["11"]["inputs"]["noise_seed"] = seed
+                graph["18"]["inputs"]["filename_prefix"] = (
+                    f"content-factory/video-{uuid.uuid4().hex}"
+                )
+            else:
+                graph["5"]["inputs"]["image"] = start_name
+                graph["6"]["inputs"]["length"] = frame_count
+                graph["10"]["inputs"]["noise_seed"] = seed
+                graph["17"]["inputs"]["filename_prefix"] = (
+                    f"content-factory/video-{uuid.uuid4().hex}"
+                )
+            started = time.monotonic()
+            output, prompt_id = self.comfyui.run(
+                graph, expected_suffixes=(".mp4",)
+            )
+        finally:
+            for path in staged:
+                path.unlink(missing_ok=True)
+        processing_time = round(time.monotonic() - started, 3)
+        width, height = self._dimensions(output)
+        measured_duration = self._duration(output)
+        return output, {
+            "type": "video",
+            "media_type": "video/mp4",
+            "filename": output.name,
+            "width": width,
+            "height": height,
+            "aspect": aspect,
+            "model": "Wan-2.2-I2V-A14B-fp8",
+            "workflow_variant": "first_last" if first_last else "i2v",
+            "input_frame_count": len(frame_urls),
+            "fps": fps,
+            "frame_count": frame_count,
+            "requested_seconds": seconds,
+            "duration": measured_duration or nominal_seconds,
+            "seed": seed,
+            "comfyui_prompt_id": prompt_id,
+            "processing_time": processing_time,
+            "mem_available_gb_at_start": available_gb,
+        }
 
     def tts(
         self, payload: dict[str, Any], work_dir: Path
@@ -866,6 +1320,30 @@ class JobProcessor:
         except (PipelineError, ValueError):
             return None
 
+    def _dimensions(self, path: Path) -> tuple[int, int]:
+        result = run_command(
+            [
+                self.config.ffprobe_bin,
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=width,height",
+                "-of",
+                "json",
+                str(path),
+            ],
+            timeout=30,
+        )
+        try:
+            streams = json.loads(result.stdout).get("streams")
+            width = int(streams[0]["width"])
+            height = int(streams[0]["height"])
+        except (AttributeError, IndexError, KeyError, TypeError, ValueError) as exc:
+            raise PipelineError(f"Cannot determine media dimensions for {path}") from exc
+        return width, height
+
 
 class Worker:
     def __init__(self, config: Config) -> None:
@@ -882,8 +1360,14 @@ class Worker:
             self.config.work_dir.mkdir(parents=True, exist_ok=True)
             self.config.asset_dir.mkdir(parents=True, exist_ok=True)
             self.config.output_dir.mkdir(parents=True, exist_ok=True)
+            self.config.comfyui_input_dir.mkdir(parents=True, exist_ok=True)
+            self.config.comfyui_output_dir.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             raise PipelineError(f"Cannot create worker directory: {exc}") from exc
+        for workflow in VISUAL_WORKFLOWS:
+            path = self.config.comfyui_workflow_dir / workflow
+            if not path.is_file():
+                raise PipelineError(f"Required visual workflow is missing: {path}")
         for executable in (
             self.config.docker_bin,
             self.config.curl_bin,
@@ -974,6 +1458,9 @@ class Worker:
     def _run_job(self, job: dict[str, Any]) -> None:
         job_id = str(job.get("id") or job.get("job_id"))
         job_type = str(job["type"]).lower()
+        claim_token = str(job.get("claim_token") or "")
+        if not claim_token:
+            raise PipelineError(f"Claimed job {job_id} is missing claim_token")
         safe_id = "".join(c if c.isalnum() or c in "-_." else "_" for c in job_id)
         job_dir = self.config.work_dir / safe_id
         if job_dir.exists():
@@ -993,7 +1480,7 @@ class Worker:
                 artifact, result = self.processor.process(job, job_dir)
                 result["attempts"] = attempt
                 result["completed_at"] = utc_now()
-                self.queue.complete(job_id, artifact, result)
+                self.queue.complete(job_id, artifact, result, claim_token)
                 with self.state_lock:
                     self.state.jobs_completed += 1
                     self.state.last_success_at = utc_now()
@@ -1019,7 +1506,7 @@ class Worker:
                 self.state.jobs_failed += 1
                 self.state.last_error = last_error
             try:
-                self.queue.fail(job_id, last_error, 3)
+                self.queue.fail(job_id, last_error, 3, claim_token)
             except PipelineError as exc:
                 LOG.error(
                     "Could not report final failure for %s: %s",
@@ -1037,12 +1524,17 @@ class Worker:
         ollama = self._ollama_models()
         f5tts = self.processor.f5tts.probe("/readyz")
         whisper = self.processor.whisper.probe("/readyz")
+        comfyui = self.processor.comfyui.probe()
         queue_depth = self.queue.queue_depth() if self.config.configured else None
         with self.state_lock:
             if queue_depth is not None:
                 self.state.last_queue_depth = queue_depth
             state = dataclasses.asdict(self.state)
-        degraded = not self.config.configured or queue_depth is None
+        degraded = (
+            not self.config.configured
+            or queue_depth is None
+            or not comfyui.get("ready")
+        )
         return {
             "status": "degraded" if degraded else "ok",
             "worker_id": self.config.worker_id,
@@ -1052,6 +1544,7 @@ class Worker:
                 "ollama": ollama,
                 "f5tts": f5tts,
                 "faster_whisper": whisper,
+                "comfyui": comfyui,
             },
             "queue_depth": queue_depth,
             "queue_configured": self.config.configured,
