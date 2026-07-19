@@ -14,16 +14,19 @@ import logging
 import mimetypes
 import os
 import re
+import secrets
 import sqlite3
 import sys
 import time
 import uuid
+from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
 import httpx
+import yaml
 from dotenv import dotenv_values
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -61,6 +64,11 @@ XAI_CHAT_URL = "https://api.x.ai/v1/chat/completions"
 XAI_VIDEO_CREATE_URL = "https://api.x.ai/v1/videos/generations"
 XAI_VIDEO_STATUS_URL = "https://api.x.ai/v1/videos/{request_id}"
 OPENAI_IMAGE_URL = "https://api.openai.com/v1/images/generations"
+OPENAI_FRAME_MODEL = "gpt-image-1"
+DEFAULT_PRESET_PATH = MONOREPO_ROOT / "config" / "presets.yaml"
+VISUAL_BACKENDS = {"local", "cloud"}
+VIDEO_MODES = {"i2v", "flf", "auto"}
+DEFAULT_STYLE_BLOCK = "Cinematic news documentary photography, realistic lighting. "
 
 VOICE_PRESETS = {
     "alireza": {
@@ -72,6 +80,13 @@ VOICE_PRESETS = {
 
 def utc_now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def new_seed(previous: int | None = None) -> int:
+    seed = secrets.randbelow(2**31)
+    if previous is not None and seed == previous:
+        return (seed + 1) % (2**31)
+    return seed
 
 
 def valid_file(path: str | Path | None) -> bool:
@@ -115,6 +130,79 @@ def atomic_write_bytes(path: Path, content: bytes) -> None:
         os.replace(partial, path)
     finally:
         partial.unlink(missing_ok=True)
+
+
+@dataclass(frozen=True)
+class PipelineConfig:
+    style_block: str = DEFAULT_STYLE_BLOCK
+    frame_model: str = "flux2_klein"
+    video_mode: str = "i2v"
+    video_resolution: str = "720p"
+    steps_draft: int = 4
+    steps_final: int = 8
+    negative_prompt: str = (
+        "text, typography, captions, logos, watermarks, user interface"
+    )
+    fps_out: int = 30
+
+    @classmethod
+    def from_mapping(cls, values: Mapping[str, Any]) -> "PipelineConfig":
+        expected = set(cls.__dataclass_fields__)
+        unknown = set(values) - expected
+        if unknown:
+            raise ValueError(f"Unknown preset keys: {', '.join(sorted(unknown))}")
+        merged = {**cls().to_dict(), **dict(values)}
+        config = cls(
+            style_block=merged["style_block"],
+            frame_model=merged["frame_model"],
+            video_mode=merged["video_mode"],
+            video_resolution=merged["video_resolution"],
+            steps_draft=merged["steps_draft"],
+            steps_final=merged["steps_final"],
+            negative_prompt=merged["negative_prompt"],
+            fps_out=merged["fps_out"],
+        )
+        config.validate()
+        return config
+
+    @classmethod
+    def load(cls, path: Path) -> "PipelineConfig":
+        try:
+            raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+        except FileNotFoundError as exc:
+            raise ValueError(f"Pipeline preset file does not exist: {path}") from exc
+        except yaml.YAMLError as exc:
+            raise ValueError(f"Invalid YAML in pipeline preset {path}: {exc}") from exc
+        if not isinstance(raw, Mapping):
+            raise ValueError(f"Pipeline preset must be a YAML mapping: {path}")
+        return cls.from_mapping(raw)
+
+    def validate(self) -> None:
+        for name in ("style_block", "frame_model", "video_resolution"):
+            if not isinstance(getattr(self, name), str) or not getattr(self, name):
+                raise ValueError(f"{name} must be a non-empty string")
+        if not isinstance(self.negative_prompt, str):
+            raise ValueError("negative_prompt must be a string")
+        if self.video_mode not in VIDEO_MODES:
+            raise ValueError(
+                "video_mode must be one of: " + ", ".join(sorted(VIDEO_MODES))
+            )
+        for name in ("steps_draft", "steps_final", "fps_out"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "style_block": self.style_block,
+            "frame_model": self.frame_model,
+            "video_mode": self.video_mode,
+            "video_resolution": self.video_resolution,
+            "steps_draft": self.steps_draft,
+            "steps_final": self.steps_final,
+            "negative_prompt": self.negative_prompt,
+            "fps_out": self.fps_out,
+        }
 
 
 def load_environment(project_root: Path) -> None:
@@ -186,9 +274,9 @@ class Settings:
             ),
             work_root=work_root
             or Path(os.getenv("NEWS_PIPELINE_WORK_ROOT", project_root / "runs")),
-            queue_url=os.getenv(
-                "JOB_QUEUE_URL", "http://100.123.208.90:8787"
-            ).rstrip("/"),
+            queue_url=os.getenv("JOB_QUEUE_URL", "http://100.123.208.90:8787").rstrip(
+                "/"
+            ),
             xai_api_key=os.getenv("XAI_API_KEY", ""),
             openai_api_key=os.getenv("OPENAI_API_KEY", ""),
             xai_text_model=os.getenv("XAI_TEXT_MODEL", "grok-4.5"),
@@ -219,6 +307,8 @@ RUN_COLUMNS = {
     "story_json",
     "script_json",
     "frames_json",
+    "frame_gate_json",
+    "run_config_json",
     "clips_json",
     "video_requests_json",
     "queue_jobs_json",
@@ -268,6 +358,8 @@ class StateStore:
                     story_json TEXT,
                     script_json TEXT,
                     frames_json TEXT,
+                    frame_gate_json TEXT,
+                    run_config_json TEXT,
                     clips_json TEXT,
                     video_requests_json TEXT,
                     queue_jobs_json TEXT,
@@ -314,12 +406,37 @@ class StateStore:
                     handled_at TEXT
                 );
 
+                CREATE TABLE IF NOT EXISTS frame_approvals (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+                    frame_index INTEGER NOT NULL,
+                    generation INTEGER NOT NULL,
+                    action TEXT NOT NULL CHECK (
+                        action IN ('approve', 'regenerate')
+                    ),
+                    telegram_update_id INTEGER NOT NULL UNIQUE,
+                    telegram_user_id TEXT,
+                    created_at TEXT NOT NULL,
+                    handled_at TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS frame_approvals_run
+                    ON frame_approvals(run_id, handled_at, id);
+
                 CREATE TABLE IF NOT EXISTS settings (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
                 );
                 """
             )
+            columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(runs)")
+            }
+            if "frame_gate_json" not in columns:
+                connection.execute("ALTER TABLE runs ADD COLUMN frame_gate_json TEXT")
+            if "run_config_json" not in columns:
+                connection.execute("ALTER TABLE runs ADD COLUMN run_config_json TEXT")
 
     def create_run(self, topic: str) -> dict[str, Any]:
         run_id = str(uuid.uuid4())
@@ -329,8 +446,9 @@ class StateStore:
                 """
                 INSERT INTO runs(
                     id, topic, status, created_at, updated_at,
-                    frames_json, clips_json, video_requests_json, queue_jobs_json
-                ) VALUES (?, ?, NULL, ?, ?, '[]', '[]', '{}', '{}')
+                    frames_json, frame_gate_json, clips_json,
+                    video_requests_json, queue_jobs_json
+                ) VALUES (?, ?, NULL, ?, ?, '[]', '{}', '[]', '{}', '{}')
                 """,
                 (run_id, topic, now, now),
             )
@@ -466,6 +584,54 @@ class StateStore:
                 (utc_now(), approval_id),
             )
 
+    def record_frame_approval(
+        self,
+        run_id: str,
+        frame_index: int,
+        generation: int,
+        action: str,
+        update_id: int,
+        user_id: str | None,
+    ) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO frame_approvals(
+                    run_id, frame_index, generation, action,
+                    telegram_update_id, telegram_user_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    frame_index,
+                    generation,
+                    action,
+                    update_id,
+                    user_id,
+                    utc_now(),
+                ),
+            )
+
+    def pending_frame_approval(self, run_id: str) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM frame_approvals
+                WHERE run_id = ? AND handled_at IS NULL
+                ORDER BY id
+                LIMIT 1
+                """,
+                (run_id,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def mark_frame_approval_handled(self, approval_id: int) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                "UPDATE frame_approvals SET handled_at = ? WHERE id = ?",
+                (utc_now(), approval_id),
+            )
+
 
 class RemoteAPIError(RuntimeError):
     pass
@@ -478,10 +644,21 @@ class NewsPipeline:
         store: StateStore,
         run: Mapping[str, Any],
         *,
+        config: PipelineConfig | None = None,
+        visuals: str = "local",
+        frame_gate: bool = True,
         http_client: httpx.Client | None = None,
         queue_client: JobQueueClient | None = None,
     ):
+        if visuals not in VISUAL_BACKENDS:
+            raise ValueError(
+                "visuals must be one of: " + ", ".join(sorted(VISUAL_BACKENDS))
+            )
         self.settings = settings
+        self.config = config or PipelineConfig()
+        self.config.validate()
+        self.visuals = visuals
+        self.frame_gate = frame_gate
         self.store = store
         self.run_id = str(run["id"])
         self.run_dir = settings.work_root / self.run_id
@@ -561,7 +738,9 @@ class NewsPipeline:
         try:
             content = data["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as exc:
-            raise RemoteAPIError("xAI response did not contain message content") from exc
+            raise RemoteAPIError(
+                "xAI response did not contain message content"
+            ) from exc
         return parse_json_text(str(content)), data
 
     def fetch_story(self) -> None:
@@ -628,10 +807,26 @@ Only select a story supported by at least two credible sources.
         story = json_load(self.current()["story_json"], None)
         if not isinstance(story, dict):
             raise ValueError("Cannot write a script without story JSON")
+        mode_instruction = {
+            "i2v": (
+                'Set "video_mode" to "i2v" and "last_frame_prompt" to null '
+                "for every shot."
+            ),
+            "flf": (
+                'Set "video_mode" to "flf" and provide a matching detailed '
+                '"last_frame_prompt" for every shot.'
+            ),
+            "auto": (
+                'Choose "i2v" or "flf" per shot. Use "flf" only when a '
+                "specific ending composition materially improves the shot; "
+                "otherwise use i2v. Provide last_frame_prompt only for flf."
+            ),
+        }[self.config.video_mode]
         system_prompt = (
             "You write accurate, fast-paced vertical news video scripts. "
             "Return only valid JSON. Do not invent facts beyond the supplied "
-            "verified story."
+            "verified story. Each shot must have exactly one simple camera "
+            "move as its motion instruction."
         )
         user_prompt = f"""
 Turn this verified story into a 50-second YouTube Short split into exactly five
@@ -640,6 +835,9 @@ Turn this verified story into a 50-second YouTube Short split into exactly five
 STORY:
 {json.dumps(story, ensure_ascii=False)}
 
+STYLE BLOCK (copy this exact string at the beginning of every frame prompt):
+{json.dumps(self.config.style_block, ensure_ascii=False)}
+
 Return exactly:
 {{
   "title": "YouTube Shorts title, factual and compelling",
@@ -647,8 +845,10 @@ Return exactly:
   "shots": [
     {{
       "voiceover_text": "spoken narration for this 10-second shot",
-      "visual_prompt": "motion/camera prompt for animating the shot",
-      "first_frame_prompt": "detailed photorealistic 9:16 opening frame prompt"
+      "motion_instruction": "one camera move, for example: slow push-in",
+      "video_mode": "i2v or flf",
+      "first_frame_prompt": "STYLE BLOCK followed by a detailed 9:16 opening frame prompt",
+      "last_frame_prompt": "STYLE BLOCK followed by a detailed ending frame prompt, or null for i2v"
     }}
   ]
 }}
@@ -657,6 +857,10 @@ Requirements:
 - Exactly five shots.
 - Total voiceover should sound natural in about 50 seconds.
 - Shot 1 hooks immediately; shot 5 explains why the story matters.
+- Exactly one short camera move per motion_instruction (for example "slow
+  push-in", "gentle pan left", or "static locked-off"); do not combine moves.
+- {mode_instruction}
+- Begin every non-null frame prompt with the STYLE BLOCK exactly as supplied.
 - No visible text, logos, watermarks, captions, or UI in image prompts.
 - Preserve uncertainty and attribution from the source story.
 """.strip()
@@ -673,9 +877,41 @@ Requirements:
         for index, shot in enumerate(shots, start=1):
             if not isinstance(shot, dict):
                 raise ValueError(f"Shot {index} must be an object")
-            for key in ("voiceover_text", "visual_prompt", "first_frame_prompt"):
-                if not str(shot.get(key, "")).strip():
-                    raise ValueError(f"Shot {index} is missing {key}")
+            motion = str(
+                shot.get("motion_instruction") or shot.get("visual_prompt") or ""
+            ).strip()
+            if not str(shot.get("voiceover_text", "")).strip():
+                raise ValueError(f"Shot {index} is missing voiceover_text")
+            if not motion:
+                raise ValueError(f"Shot {index} is missing motion_instruction")
+            if (
+                len(motion.split()) > 12
+                or any(mark in motion for mark in ("\n", ";", ",", "/"))
+                or re.search(r"\b(and|then|followed by)\b", motion, re.IGNORECASE)
+            ):
+                raise ValueError(
+                    f"Shot {index} motion_instruction must be one camera move"
+                )
+            mode = (
+                self.config.video_mode
+                if self.config.video_mode != "auto"
+                else str(shot.get("video_mode", "")).lower()
+            )
+            if mode not in {"i2v", "flf"}:
+                raise ValueError(f"Shot {index} has invalid video_mode: {mode}")
+            first_prompt = str(shot.get("first_frame_prompt", ""))
+            if not first_prompt.strip():
+                raise ValueError(f"Shot {index} is missing first_frame_prompt")
+            last_prompt = str(shot.get("last_frame_prompt") or "")
+            if mode == "flf" and not last_prompt.strip():
+                raise ValueError(f"Shot {index} is missing last_frame_prompt")
+            shot["motion_instruction"] = motion
+            shot["visual_prompt"] = motion
+            shot["video_mode"] = mode
+            shot["first_frame_prompt"] = self._with_style(first_prompt)
+            shot["last_frame_prompt"] = (
+                self._with_style(last_prompt) if mode == "flf" else None
+            )
         title = str(script.get("title") or story["title"]).strip()
         description = str(script.get("description") or story["summary"]).strip()
         self.store.update_run(
@@ -687,15 +923,66 @@ Requirements:
             last_error=None,
         )
 
-    def _openai_image(self, prompt: str) -> bytes:
-        api_key = self.require_key(
-            "OPENAI_API_KEY", self.settings.openai_api_key
+    def _with_style(self, prompt: str) -> str:
+        if prompt.startswith(self.config.style_block):
+            return prompt
+        return f"{self.config.style_block}{prompt}"
+
+    def _shot_mode(self, shot: Mapping[str, Any], index: int) -> str:
+        mode = (
+            self.config.video_mode
+            if self.config.video_mode != "auto"
+            else str(shot.get("video_mode", "")).lower()
         )
+        if mode not in {"i2v", "flf"}:
+            raise ValueError(f"Shot {index} has invalid video_mode: {mode}")
+        return mode
+
+    def _frame_specs(self, script: Mapping[str, Any]) -> list[dict[str, Any]]:
+        shots = script.get("shots", [])
+        if not isinstance(shots, list) or len(shots) != SHOT_COUNT:
+            raise ValueError("Cannot resolve frames without five scripted shots")
+        specs: list[dict[str, Any]] = []
+        for shot_index, shot in enumerate(shots, start=1):
+            if not isinstance(shot, Mapping):
+                raise ValueError(f"Shot {shot_index} must be an object")
+            mode = self._shot_mode(shot, shot_index)
+            first_prompt = str(shot.get("first_frame_prompt", ""))
+            if not first_prompt.strip():
+                raise ValueError(f"Shot {shot_index} is missing first_frame_prompt")
+            specs.append(
+                {
+                    "index": len(specs) + 1,
+                    "shot_index": shot_index,
+                    "role": "first",
+                    "prompt": self._with_style(first_prompt),
+                    "path": self.run_dir / "frames" / f"shot_{shot_index:02d}.png",
+                }
+            )
+            if mode == "flf":
+                last_prompt = str(shot.get("last_frame_prompt") or "")
+                if not last_prompt.strip():
+                    raise ValueError(f"Shot {shot_index} is missing last_frame_prompt")
+                specs.append(
+                    {
+                        "index": len(specs) + 1,
+                        "shot_index": shot_index,
+                        "role": "last",
+                        "prompt": self._with_style(last_prompt),
+                        "path": (
+                            self.run_dir / "frames" / f"shot_{shot_index:02d}_last.png"
+                        ),
+                    }
+                )
+        return specs
+
+    def _openai_image(self, prompt: str) -> bytes:
+        api_key = self.require_key("OPENAI_API_KEY", self.settings.openai_api_key)
         response = self.http.post(
             OPENAI_IMAGE_URL,
             headers={"Authorization": f"Bearer {api_key}"},
             json={
-                "model": self.settings.openai_image_model,
+                "model": OPENAI_FRAME_MODEL,
                 "prompt": prompt,
                 "size": "1024x1536",
                 "quality": self.settings.openai_image_quality,
@@ -712,7 +999,9 @@ Requirements:
             try:
                 return base64.b64decode(image["b64_json"], validate=True)
             except (ValueError, TypeError) as exc:
-                raise RemoteAPIError("OpenAI returned invalid base64 image data") from exc
+                raise RemoteAPIError(
+                    "OpenAI returned invalid base64 image data"
+                ) from exc
         if image.get("url"):
             download = self.http.get(image["url"])
             try:
@@ -722,31 +1011,121 @@ Requirements:
             return download.content
         raise RemoteAPIError("OpenAI image response had neither b64_json nor url")
 
+    def _save_frame_gate(self, state: Mapping[str, Any]) -> None:
+        self.store.update_run(
+            self.run_id,
+            frame_gate_json=json.dumps(dict(state)),
+            last_error=None,
+        )
+
+    def _ensure_frame_gate_state(self, specs: list[dict[str, Any]]) -> dict[str, Any]:
+        state = json_load(self.current().get("frame_gate_json"), {})
+        frames = state.get("frames") if isinstance(state, Mapping) else None
+        expected = [
+            (spec["shot_index"], spec["role"], str(spec["path"])) for spec in specs
+        ]
+        actual = (
+            [
+                (
+                    frame.get("shot_index"),
+                    frame.get("role"),
+                    frame.get("path"),
+                )
+                for frame in frames
+                if isinstance(frame, Mapping)
+            ]
+            if isinstance(frames, list)
+            else []
+        )
+        if actual != expected:
+            state = {
+                "version": 1,
+                "chat_id": None,
+                "album_message_ids": [],
+                "frames": [
+                    {
+                        "index": spec["index"],
+                        "shot_index": spec["shot_index"],
+                        "role": spec["role"],
+                        "path": str(spec["path"]),
+                        "seed": new_seed(),
+                        "generation": 0,
+                        "status": "generating",
+                        "album_message_id": None,
+                        "control_message_id": None,
+                    }
+                    for spec in specs
+                ],
+            }
+            self._save_frame_gate(state)
+        return dict(state)
+
+    def _frame_prompt(self, spec: Mapping[str, Any], seed: int) -> str:
+        prompt = (
+            f"{spec['prompt']}\n\n"
+            "Vertical 9:16 composition. No words, typography, logos, "
+            "watermarks, captions, or user interface."
+        )
+        if self.config.negative_prompt:
+            prompt += f"\nAvoid: {self.config.negative_prompt}."
+        if self.visuals == "cloud":
+            prompt += f"\nVariation seed: {seed}."
+        return prompt
+
+    def _generate_frame(
+        self,
+        spec: Mapping[str, Any],
+        gate_frame: Mapping[str, Any],
+    ) -> None:
+        path = Path(spec["path"])
+        seed = int(gate_frame["seed"])
+        generation = int(gate_frame["generation"])
+        if self.visuals == "local":
+            self._queue_job(
+                (f"frame:{spec['shot_index']}:{spec['role']}:generation:{generation}"),
+                "frame",
+                {
+                    "workflow": self.config.frame_model,
+                    "prompt": self._frame_prompt(spec, seed),
+                    "negative_prompt": self.config.negative_prompt,
+                    "aspect_ratio": "9:16",
+                    "resolution": self.config.video_resolution,
+                    "steps": self.config.steps_draft,
+                    "seed": seed,
+                    "output_format": "png",
+                },
+                {},
+                path,
+            )
+        elif not valid_file(path):
+            atomic_write_bytes(
+                path,
+                self._openai_image(self._frame_prompt(spec, seed)),
+            )
+
     def generate_first_frames(self) -> None:
         script = json_load(self.current()["script_json"], {})
-        shots = script.get("shots", [])
-        if len(shots) != SHOT_COUNT:
-            raise ValueError("Cannot generate frames without five scripted shots")
-        frames: list[str] = []
-        for index, shot in enumerate(shots, start=1):
-            path = self.run_dir / "frames" / f"shot_{index:02d}.png"
-            if not valid_file(path):
-                prompt = (
-                    f"{shot['first_frame_prompt']}\n\n"
-                    "Vertical 9:16 composition, cinematic news documentary "
-                    "photography, realistic lighting, no words, no typography, "
-                    "no logos, no watermark."
-                )
-                LOG.info("Generating first frame %s/%s", index, SHOT_COUNT)
-                atomic_write_bytes(path, self._openai_image(prompt))
-            frames.append(str(path))
-            self.store.update_run(
-                self.run_id, frames_json=json.dumps(frames), last_error=None
+        specs = self._frame_specs(script)
+        state = self._ensure_frame_gate_state(specs)
+        gate_frames = state["frames"]
+        paths = [str(spec["path"]) for spec in specs]
+        self.store.update_run(self.run_id, frames_json=json.dumps(paths))
+        for spec, gate_frame in zip(specs, gate_frames, strict=True):
+            LOG.info(
+                "Generating %s frame for shot %s (%s/%s)",
+                spec["role"],
+                spec["shot_index"],
+                spec["index"],
+                len(specs),
             )
+            self._generate_frame(spec, gate_frame)
+            gate_frame["status"] = "pending" if self.frame_gate else "generated"
+            self._save_frame_gate(state)
         self.store.update_run(
             self.run_id,
             status="framed",
-            frames_json=json.dumps(frames),
+            frames_json=json.dumps(paths),
+            frame_gate_json=json.dumps(state),
             last_error=None,
         )
 
@@ -760,19 +1139,27 @@ Requirements:
             self.run_id, video_requests_json=json.dumps(dict(requests))
         )
 
-    def _start_video(self, frame: Path, prompt: str) -> str:
+    def _start_video(
+        self,
+        first_frame: Path,
+        prompt: str,
+        last_frame: Path | None = None,
+    ) -> str:
         api_key = self.require_key("XAI_API_KEY", self.settings.xai_api_key)
+        payload: dict[str, Any] = {
+            "model": self.settings.video_model,
+            "prompt": prompt,
+            "image": {"url": self._image_data_uri(first_frame)},
+            "duration": 10,
+            "aspect_ratio": "9:16",
+            "resolution": self.config.video_resolution,
+        }
+        if last_frame is not None:
+            payload["last_frame"] = {"url": self._image_data_uri(last_frame)}
         response = self.http.post(
             XAI_VIDEO_CREATE_URL,
             headers={"Authorization": f"Bearer {api_key}"},
-            json={
-                "model": self.settings.video_model,
-                "prompt": prompt,
-                "image": {"url": self._image_data_uri(frame)},
-                "duration": 10,
-                "aspect_ratio": "9:16",
-                "resolution": "720p",
-            },
+            json=payload,
         )
         data = self._response_json(response, "xAI Imagine Video")
         request_id = data.get("request_id")
@@ -811,9 +1198,7 @@ Requirements:
 
     def _download_file(self, url: str, destination: Path) -> None:
         destination.parent.mkdir(parents=True, exist_ok=True)
-        partial = destination.with_name(
-            f".{destination.name}.{uuid.uuid4().hex}.part"
-        )
+        partial = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.part")
         try:
             with self.http.stream("GET", url) as response:
                 try:
@@ -832,35 +1217,86 @@ Requirements:
     def generate_clips(self) -> None:
         row = self.current()
         script = json_load(row["script_json"], {})
+        specs = self._frame_specs(script)
         frames = [Path(path) for path in json_load(row["frames_json"], [])]
-        if len(frames) != SHOT_COUNT or not all(valid_file(path) for path in frames):
-            raise ValueError("Cannot generate clips without all five frames")
+        if len(frames) != len(specs) or not all(valid_file(path) for path in frames):
+            raise ValueError("Cannot generate clips without all scripted frames")
+        if self.frame_gate:
+            gate = self._ensure_frame_gate_state(specs)
+            if not all(
+                frame.get("status") == "approved" for frame in gate.get("frames", [])
+            ):
+                raise RuntimeError(
+                    "Cannot enqueue video jobs until every frame is approved"
+                )
+        frames_by_shot: dict[int, dict[str, Path]] = {}
+        for spec, path in zip(specs, frames, strict=True):
+            frames_by_shot.setdefault(int(spec["shot_index"]), {})[
+                str(spec["role"])
+            ] = path
         requests: dict[str, str] = json_load(row["video_requests_json"], {})
         clips: list[str] = []
-        for index, (shot, frame) in enumerate(
-            zip(script["shots"], frames, strict=True), start=1
-        ):
+        for index, shot in enumerate(script["shots"], start=1):
             key = str(index)
             path = self.run_dir / "clips" / f"shot_{index:02d}.mp4"
             if not valid_file(path):
-                request_id = requests.get(key)
-                if not request_id:
-                    LOG.info("Submitting xAI video %s/%s", index, SHOT_COUNT)
-                    request_id = self._start_video(
-                        frame,
-                        str(shot["visual_prompt"]),
+                mode = self._shot_mode(shot, index)
+                shot_frames = frames_by_shot[index]
+                first_frame = shot_frames["first"]
+                last_frame = shot_frames.get("last")
+                motion = str(
+                    shot.get("motion_instruction") or shot.get("visual_prompt") or ""
+                ).strip()
+                if self.visuals == "local":
+                    input_files = (
+                        {"frame": first_frame}
+                        if mode == "i2v"
+                        else {
+                            "first_frame": first_frame,
+                            "last_frame": last_frame,
+                        }
                     )
-                    requests[key] = request_id
-                    self._persist_video_requests(requests)
-                try:
-                    video_url = self._poll_video(request_id)
-                except RemoteAPIError as exc:
-                    if "ended as failed" in str(exc) or "ended as expired" in str(exc):
-                        requests.pop(key, None)
+                    self._queue_job(
+                        f"video:{index}",
+                        "video",
+                        {
+                            "mode": mode,
+                            "prompt": motion,
+                            "motion_instruction": motion,
+                            "negative_prompt": self.config.negative_prompt,
+                            "resolution": self.config.video_resolution,
+                            "steps": self.config.steps_final,
+                            "seed": new_seed(),
+                            "duration_seconds": 10,
+                            "fps": 16,
+                            "aspect_ratio": "9:16",
+                            "output_format": "mp4",
+                        },
+                        input_files,
+                        path,
+                    )
+                else:
+                    request_id = requests.get(key)
+                    if not request_id:
+                        LOG.info("Submitting xAI video %s/%s", index, SHOT_COUNT)
+                        request_id = self._start_video(
+                            first_frame,
+                            motion,
+                            last_frame,
+                        )
+                        requests[key] = request_id
                         self._persist_video_requests(requests)
-                    raise
-                LOG.info("Downloading xAI video %s/%s", index, SHOT_COUNT)
-                self._download_file(video_url, path)
+                    try:
+                        video_url = self._poll_video(request_id)
+                    except RemoteAPIError as exc:
+                        if "ended as failed" in str(exc) or "ended as expired" in str(
+                            exc
+                        ):
+                            requests.pop(key, None)
+                            self._persist_video_requests(requests)
+                        raise
+                    LOG.info("Downloading xAI video %s/%s", index, SHOT_COUNT)
+                    self._download_file(video_url, path)
             clips.append(str(path))
             self.store.update_run(
                 self.run_id,
@@ -896,9 +1332,7 @@ Requirements:
             if queued and queued.get("status") == "failed":
                 jobs.pop(key, None)
                 job_id = None
-                self.store.update_run(
-                    self.run_id, queue_jobs_json=json.dumps(jobs)
-                )
+                self.store.update_run(self.run_id, queue_jobs_json=json.dumps(jobs))
         if not job_id:
             job = self.queue.submit(
                 job_type,
@@ -907,9 +1341,7 @@ Requirements:
             )
             job_id = str(job["id"])
             jobs[key] = job_id
-            self.store.update_run(
-                self.run_id, queue_jobs_json=json.dumps(jobs)
-            )
+            self.store.update_run(self.run_id, queue_jobs_json=json.dumps(jobs))
         try:
             self.queue.wait(
                 job_id,
@@ -918,9 +1350,7 @@ Requirements:
             )
         except JobFailedError:
             jobs.pop(key, None)
-            self.store.update_run(
-                self.run_id, queue_jobs_json=json.dumps(jobs)
-            )
+            self.store.update_run(self.run_id, queue_jobs_json=json.dumps(jobs))
             raise
 
     def generate_voiceover_and_captions(self) -> None:
@@ -1011,8 +1441,7 @@ Requirements:
             raise ValueError("Assemble inputs are incomplete")
         final_path = self.run_dir / "final.mp4"
         inputs: dict[str, Path] = {
-            f"clip_{index}": path
-            for index, path in enumerate(clips, start=1)
+            f"clip_{index}": path for index, path in enumerate(clips, start=1)
         }
         inputs["voiceover"] = voiceover
         inputs["captions"] = captions
@@ -1025,6 +1454,9 @@ Requirements:
                 "captions_role": "captions",
                 "shot_duration_seconds": 10,
                 "aspect_ratio": "9:16",
+                "input_fps": 16,
+                "fps_out": self.config.fps_out,
+                "pre_caption_video_filter": (f"minterpolate=fps={self.config.fps_out}"),
                 "burn_captions": True,
                 "output_format": "mp4",
             },
@@ -1046,9 +1478,7 @@ Requirements:
         files: Mapping[str, Any] | None = None,
         timeout: float | None = None,
     ) -> dict[str, Any]:
-        token = self.require_key(
-            "TELEGRAM_BOT_TOKEN", self.settings.telegram_bot_token
-        )
+        token = self.require_key("TELEGRAM_BOT_TOKEN", self.settings.telegram_bot_token)
         url = f"https://api.telegram.org/bot{token}/{method}"
         response = self.http.post(
             url,
@@ -1062,6 +1492,288 @@ Requirements:
                 f"Telegram {method} failed: {result.get('description', result)}"
             )
         return result
+
+    def _frame_keyboard(self, frame: Mapping[str, Any]) -> str:
+        suffix = f"{self.run_id}:{int(frame['index'])}:{int(frame['generation'])}"
+        return json.dumps(
+            {
+                "inline_keyboard": [
+                    [
+                        {
+                            "text": "✅ Approve",
+                            "callback_data": f"np:f:a:{suffix}",
+                        },
+                        {
+                            "text": "🔄 Regenerate",
+                            "callback_data": f"np:f:g:{suffix}",
+                        },
+                    ]
+                ]
+            }
+        )
+
+    def _send_frame_control(
+        self,
+        state: dict[str, Any],
+        frame: dict[str, Any],
+    ) -> None:
+        chat_id = str(state["chat_id"])
+        message_id = frame.get("control_message_id")
+        if message_id:
+            self._telegram_api(
+                "editMessageReplyMarkup",
+                data={
+                    "chat_id": chat_id,
+                    "message_id": str(message_id),
+                    "reply_markup": self._frame_keyboard(frame),
+                },
+            )
+            return
+        label = f"Shot {frame['shot_index']} · {str(frame['role']).title()} frame"
+        response = self._telegram_api(
+            "sendMessage",
+            data={
+                "chat_id": chat_id,
+                "text": label,
+                "reply_to_message_id": str(frame["album_message_id"]),
+                "reply_markup": self._frame_keyboard(frame),
+            },
+        )
+        frame["control_message_id"] = str(response["result"]["message_id"])
+        self._save_frame_gate(state)
+
+    def _send_frame_album(
+        self,
+        state: dict[str, Any],
+        specs: list[dict[str, Any]],
+    ) -> None:
+        chat_id = self.require_key(
+            "TELEGRAM_CHAT_ID or TELEGRAM_DEFAULT_CHAT_ID",
+            self.settings.telegram_chat_id,
+        )
+        media = []
+        with ExitStack() as stack:
+            files: dict[str, Any] = {}
+            for spec in specs:
+                attachment = f"frame_{spec['index']}"
+                path = Path(spec["path"])
+                handle = stack.enter_context(path.open("rb"))
+                files[attachment] = (path.name, handle, "image/png")
+                item: dict[str, Any] = {
+                    "type": "photo",
+                    "media": f"attach://{attachment}",
+                }
+                if spec["index"] == 1:
+                    item["caption"] = (
+                        f"Frame approval · {self.current()['title'] or 'News Short'}"
+                        f"\nRun: {self.run_id}"
+                    )[:1024]
+                media.append(item)
+            response = self._telegram_api(
+                "sendMediaGroup",
+                data={"chat_id": chat_id, "media": json.dumps(media)},
+                files=files,
+                timeout=max(self.settings.request_timeout, 300),
+            )
+        messages = response.get("result")
+        if not isinstance(messages, list) or len(messages) != len(specs):
+            raise RemoteAPIError(
+                "Telegram sendMediaGroup returned an unexpected message count"
+            )
+        state["chat_id"] = str(chat_id)
+        state["album_message_ids"] = [
+            str(message["message_id"]) for message in messages
+        ]
+        state["requested_at"] = utc_now()
+        for frame, message_id in zip(
+            state["frames"], state["album_message_ids"], strict=True
+        ):
+            frame["album_message_id"] = message_id
+        self._save_frame_gate(state)
+
+    def _edit_frame_album_item(
+        self,
+        state: Mapping[str, Any],
+        frame: Mapping[str, Any],
+    ) -> None:
+        path = Path(str(frame["path"]))
+        with path.open("rb") as image:
+            self._telegram_api(
+                "editMessageMedia",
+                data={
+                    "chat_id": str(state["chat_id"]),
+                    "message_id": str(frame["album_message_id"]),
+                    "media": json.dumps({"type": "photo", "media": "attach://frame"}),
+                },
+                files={"frame": (path.name, image, "image/png")},
+                timeout=max(self.settings.request_timeout, 300),
+            )
+
+    def request_frame_approval(self) -> None:
+        script = json_load(self.current()["script_json"], {})
+        specs = self._frame_specs(script)
+        if not all(valid_file(spec["path"]) for spec in specs):
+            raise ValueError("Cannot request approval with missing frames")
+        state = self._ensure_frame_gate_state(specs)
+        if not state.get("album_message_ids"):
+            self._send_frame_album(state, specs)
+        for frame in state["frames"]:
+            if frame.get("status") == "pending" and not frame.get("control_message_id"):
+                self._send_frame_control(state, frame)
+
+    def _consume_frame_callback(self, update: Mapping[str, Any]) -> str | None:
+        callback = update.get("callback_query")
+        if not isinstance(callback, Mapping):
+            return None
+        match = re.fullmatch(
+            r"np:f:(a|g):([0-9a-fA-F-]{36}):(\d+):(\d+)",
+            str(callback.get("data", "")),
+        )
+        if not match or match.group(2) != self.run_id:
+            return None
+        frame_index = int(match.group(3))
+        generation = int(match.group(4))
+        state = json_load(self.current().get("frame_gate_json"), {})
+        frames = state.get("frames", []) if isinstance(state, Mapping) else []
+        frame = next(
+            (
+                item
+                for item in frames
+                if isinstance(item, Mapping)
+                and int(item.get("index", -1)) == frame_index
+            ),
+            None,
+        )
+        message = callback.get("message")
+        chat = message.get("chat") if isinstance(message, Mapping) else None
+        if (
+            frame is None
+            or frame.get("status") != "pending"
+            or int(frame.get("generation", -1)) != generation
+            or not isinstance(chat, Mapping)
+            or str(chat.get("id", "")) != str(state.get("chat_id"))
+            or str(message.get("message_id", ""))
+            != str(frame.get("control_message_id"))
+        ):
+            return None
+        action = {"a": "approve", "g": "regenerate"}[match.group(1)]
+        user = callback.get("from")
+        user_id = str(user.get("id")) if isinstance(user, Mapping) else None
+        self.store.record_frame_approval(
+            self.run_id,
+            frame_index,
+            generation,
+            action,
+            int(update["update_id"]),
+            user_id,
+        )
+        self._answer_callback(
+            str(callback.get("id", "")),
+            "Approved" if action == "approve" else "Regenerating",
+        )
+        return action
+
+    def wait_for_frame_approval(self) -> dict[str, Any] | None:
+        pending = self.store.pending_frame_approval(self.run_id)
+        if pending is not None:
+            return pending
+        self.require_key("TELEGRAM_BOT_TOKEN", self.settings.telegram_bot_token)
+        deadline = (
+            time.monotonic() + self.settings.approval_wait_timeout
+            if self.settings.approval_wait_timeout > 0
+            else None
+        )
+        offset = int(self.store.get_setting("telegram_update_offset", "0"))
+        while deadline is None or time.monotonic() < deadline:
+            result = self._telegram_api(
+                "getUpdates",
+                data={
+                    "offset": str(offset),
+                    "timeout": str(self.settings.telegram_poll_timeout),
+                    "allowed_updates": json.dumps(["callback_query"]),
+                },
+                timeout=self.settings.telegram_poll_timeout + 10,
+            )
+            for update in result.get("result", []):
+                update_id = int(update["update_id"])
+                action = self._consume_frame_callback(update)
+                offset = max(offset, update_id + 1)
+                self.store.set_setting("telegram_update_offset", str(offset))
+                if action:
+                    return self.store.pending_frame_approval(self.run_id)
+        return None
+
+    def _process_frame_approval(self, decision: Mapping[str, Any]) -> None:
+        state = json_load(self.current().get("frame_gate_json"), {})
+        frame = next(
+            (
+                item
+                for item in state.get("frames", [])
+                if int(item.get("index", -1)) == int(decision["frame_index"])
+            ),
+            None,
+        )
+        if (
+            frame is None
+            or frame.get("status") != "pending"
+            or int(frame.get("generation", -1)) != int(decision["generation"])
+        ):
+            self.store.mark_frame_approval_handled(int(decision["id"]))
+            return
+        if decision["action"] == "approve":
+            frame["status"] = "approved"
+            frame["approved_at"] = utc_now()
+            self._save_frame_gate(state)
+            self.store.mark_frame_approval_handled(int(decision["id"]))
+            self._remove_keyboard(
+                str(state["chat_id"]), str(frame["control_message_id"])
+            )
+            return
+        Path(str(frame["path"])).unlink(missing_ok=True)
+        frame["generation"] = int(frame["generation"]) + 1
+        frame["seed"] = new_seed(int(frame["seed"]))
+        frame["status"] = "generating"
+        frame["approved_at"] = None
+        self._save_frame_gate(state)
+        self.store.mark_frame_approval_handled(int(decision["id"]))
+
+    def _resume_frame_regenerations(self) -> None:
+        script = json_load(self.current()["script_json"], {})
+        specs = self._frame_specs(script)
+        specs_by_index = {int(spec["index"]): spec for spec in specs}
+        state = self._ensure_frame_gate_state(specs)
+        for frame in state["frames"]:
+            if frame.get("status") != "generating":
+                continue
+            spec = specs_by_index[int(frame["index"])]
+            LOG.info(
+                "Regenerating shot %s %s frame with seed %s",
+                frame["shot_index"],
+                frame["role"],
+                frame["seed"],
+            )
+            self._generate_frame(spec, frame)
+            self._edit_frame_album_item(state, frame)
+            self._send_frame_control(state, frame)
+            frame["status"] = "pending"
+            self._save_frame_gate(state)
+
+    def run_frame_gate(self) -> bool:
+        state = json_load(self.current().get("frame_gate_json"), {})
+        if state.get("album_message_ids"):
+            self._resume_frame_regenerations()
+        self.request_frame_approval()
+        while True:
+            self._resume_frame_regenerations()
+            state = json_load(self.current().get("frame_gate_json"), {})
+            if all(
+                frame.get("status") == "approved" for frame in state.get("frames", [])
+            ):
+                return True
+            decision = self.wait_for_frame_approval()
+            if decision is None:
+                return False
+            self._process_frame_approval(decision)
 
     def _approval_keyboard(self) -> str:
         return json.dumps(
@@ -1175,9 +1887,8 @@ Requirements:
             return None
         chat_id = str(chat.get("id", ""))
         message_id = str(message.get("message_id", ""))
-        if (
-            chat_id != str(row["telegram_chat_id"])
-            or message_id != str(row["telegram_message_id"])
+        if chat_id != str(row["telegram_chat_id"]) or message_id != str(
+            row["telegram_message_id"]
         ):
             return None
         actions = {"a": "approve", "r": "reject", "g": "regenerate"}
@@ -1194,9 +1905,7 @@ Requirements:
         pending = self.store.pending_approval(self.run_id)
         if pending is not None:
             return pending
-        self.require_key(
-            "TELEGRAM_BOT_TOKEN", self.settings.telegram_bot_token
-        )
+        self.require_key("TELEGRAM_BOT_TOKEN", self.settings.telegram_bot_token)
         deadline = (
             time.monotonic() + self.settings.approval_wait_timeout
             if self.settings.approval_wait_timeout > 0
@@ -1254,6 +1963,7 @@ Requirements:
             self.run_id,
             status="scripted",
             frames_json="[]",
+            frame_gate_json="{}",
             clips_json="[]",
             video_requests_json="{}",
             queue_jobs_json="{}",
@@ -1273,13 +1983,26 @@ Requirements:
             return
         frames = json_load(row["frames_json"], [])
         clips = json_load(row["clips_json"], [])
-        if STATUS_INDEX[status] >= STATUS_INDEX["framed"] and (
-            len(frames) != SHOT_COUNT or not all(valid_file(path) for path in frames)
-        ):
+        script = json_load(row["script_json"], {})
+        try:
+            expected_frames = self._frame_specs(script)
+        except ValueError:
+            expected_frames = []
+        gate = json_load(row.get("frame_gate_json"), {})
+        regenerating_paths = {
+            str(frame.get("path"))
+            for frame in gate.get("frames", [])
+            if isinstance(frame, Mapping) and frame.get("status") == "generating"
+        }
+        frames_complete = len(frames) == len(expected_frames) and all(
+            valid_file(path) or str(path) in regenerating_paths for path in frames
+        )
+        if STATUS_INDEX[status] >= STATUS_INDEX["framed"] and (not frames_complete):
             self.store.update_run(
                 self.run_id,
                 status="scripted",
                 frames_json="[]",
+                frame_gate_json="{}",
                 clips_json="[]",
                 video_requests_json="{}",
                 queue_jobs_json="{}",
@@ -1367,9 +2090,7 @@ Requirements:
                 self.run_stage("write_script", self.write_script)
                 continue
             if status == "scripted":
-                self.run_stage(
-                    "generate_first_frames", self.generate_first_frames
-                )
+                self.run_stage("generate_first_frames", self.generate_first_frames)
                 continue
             if status == "framed":
                 if dry_run:
@@ -1378,6 +2099,16 @@ Requirements:
                         self.run_id,
                     )
                     return self.current()
+                if self.frame_gate:
+                    gate_holder: dict[str, bool] = {}
+
+                    def gate() -> None:
+                        gate_holder["approved"] = self.run_frame_gate()
+
+                    self.run_stage("frame_gate", gate)
+                    if not gate_holder.get("approved"):
+                        LOG.info("Frame approval wait timed out; run remains framed")
+                        return self.current()
                 self.run_stage("generate_clips", self.generate_clips)
                 continue
             if status == "rendered":
@@ -1447,7 +2178,26 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Stop after stage 3 (five first-frame images).",
+        help="Stop after frame generation, before frame approval.",
+    )
+    parser.add_argument(
+        "--visuals",
+        choices=sorted(VISUAL_BACKENDS),
+        default="local",
+        help="Visual generation backend (default: local).",
+    )
+    parser.add_argument(
+        "--no-frame-gate",
+        action="store_false",
+        dest="frame_gate",
+        default=True,
+        help="Skip per-frame Telegram approval.",
+    )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=DEFAULT_PRESET_PATH,
+        help=f"Pipeline preset YAML (default: {DEFAULT_PRESET_PATH}).",
     )
     parser.add_argument(
         "--db",
@@ -1495,6 +2245,43 @@ def choose_run(
     return store.create_run(selected_topic)
 
 
+def configure_run(
+    store: StateStore,
+    run: Mapping[str, Any],
+    *,
+    config: PipelineConfig,
+    visuals: str,
+    frame_gate: bool,
+    preset_path: Path | None = None,
+) -> tuple[dict[str, Any], PipelineConfig, str, bool]:
+    stored = json_load(run.get("run_config_json"), {})
+    if isinstance(stored, Mapping) and stored.get("preset"):
+        run_config = PipelineConfig.from_mapping(stored["preset"])
+        run_visuals = str(stored.get("visuals", "local"))
+        if run_visuals not in VISUAL_BACKENDS:
+            raise ValueError(
+                f"Run {run['id']} has invalid visuals backend: {run_visuals}"
+            )
+        return dict(run), run_config, run_visuals, bool(stored.get("frame_gate", True))
+    snapshot = {
+        "preset": config.to_dict(),
+        "visuals": visuals,
+        "frame_gate": frame_gate,
+        "preset_path": str(preset_path) if preset_path else None,
+        "loaded_at": utc_now(),
+    }
+    updated = store.update_run(str(run["id"]), run_config_json=json.dumps(snapshot))
+    return updated, config, visuals, frame_gate
+
+
+def validate_startup(settings: Settings, visuals: str) -> None:
+    if visuals == "cloud" and not settings.xai_api_key:
+        raise RuntimeError(
+            "XAI_API_KEY is required for --visuals cloud; refusing to start "
+            "before any API spend or queue activity."
+        )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -1504,11 +2291,20 @@ def main(argv: list[str] | None = None) -> int:
     )
     project_root = Path(__file__).resolve().parent
     load_environment(project_root)
+    try:
+        preset = PipelineConfig.load(args.config.expanduser().resolve())
+    except ValueError as exc:
+        parser.error(str(exc))
     settings = Settings.from_environment(
         project_root,
         database_path=args.db,
         work_root=args.work_root,
     )
+    try:
+        validate_startup(settings, args.visuals)
+    except RuntimeError as exc:
+        LOG.error("%s", exc)
+        return 2
     store = StateStore(settings.database_path)
     try:
         run = choose_run(
@@ -1517,9 +2313,29 @@ def main(argv: list[str] | None = None) -> int:
             topic=args.topic,
             new=args.new,
         )
+        run, preset, visuals, frame_gate = configure_run(
+            store,
+            run,
+            config=preset,
+            visuals=args.visuals,
+            frame_gate=args.frame_gate,
+            preset_path=args.config.expanduser().resolve(),
+        )
     except ValueError as exc:
         parser.error(str(exc))
-    pipeline = NewsPipeline(settings, store, run)
+    try:
+        validate_startup(settings, visuals)
+    except RuntimeError as exc:
+        LOG.error("%s", exc)
+        return 2
+    pipeline = NewsPipeline(
+        settings,
+        store,
+        run,
+        config=preset,
+        visuals=visuals,
+        frame_gate=frame_gate,
+    )
     try:
         result = pipeline.run(dry_run=args.dry_run)
     except Exception:

@@ -1,0 +1,10 @@
+# Pipeline-wide visual and render defaults. Changes apply to new runs; each run
+# snapshots these values so a restart cannot silently change its output.
+style_block: "Cinematic news documentary photography, realistic lighting. "
+frame_model: flux2_klein
+video_mode: i2v
+video_resolution: 720p
+steps_draft: 4
+steps_final: 8
+negative_prompt: "text, typography, captions, logos, watermarks, user interface"
+fps_out: 30

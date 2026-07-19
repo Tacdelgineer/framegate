@@ -49,9 +49,12 @@ The news pipeline uses these job types and file roles:
 
 | Job type | Input roles | Result |
 | --- | --- | --- |
+| `frame` | none | generated PNG frame |
+| `video` (I2V) | `frame` | generated MP4 clip |
+| `video` (first/last) | `first_frame`, `last_frame` | generated MP4 clip |
 | `tts` | none | generated audio |
 | `transcribe` | `audio` | transcript file |
 | `assemble` | `clip_1`…`clip_5`, `voiceover`, `captions` | assembled video |
 
-Grok/OpenAI requests should remain in the VPS pipeline and should not be added
-to DGX handlers.
+Story/script model requests remain in the VPS pipeline. Visual jobs use these
+queue types in local mode and use OpenAI/xAI directly in cloud mode.

@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import base64
+from dataclasses import replace
 from pathlib import Path
 
 import httpx
+import pytest
 
 import news_pipeline as module
 
@@ -239,7 +241,13 @@ def test_fetch_story_uses_xai_chat_live_search(tmp_path: Path) -> None:
     run = store.create_run("test")
     client = httpx.Client(transport=httpx.MockTransport(handler))
     pipeline = module.NewsPipeline(
-        config, store, run, http_client=client, queue_client=FakeQueue()
+        config,
+        store,
+        run,
+        visuals="cloud",
+        frame_gate=False,
+        http_client=client,
+        queue_client=FakeQueue(),
     )
     try:
         pipeline.fetch_story()
@@ -261,11 +269,7 @@ def test_first_frames_use_gpt_image_1_portrait_contract(tmp_path: Path) -> None:
         calls.append(payload)
         return httpx.Response(
             200,
-            json={
-                "data": [
-                    {"b64_json": base64.b64encode(b"image").decode("ascii")}
-                ]
-            },
+            json={"data": [{"b64_json": base64.b64encode(b"image").decode("ascii")}]},
         )
 
     config = settings(tmp_path)
@@ -287,7 +291,13 @@ def test_first_frames_use_gpt_image_1_portrait_contract(tmp_path: Path) -> None:
     )
     client = httpx.Client(transport=httpx.MockTransport(handler))
     pipeline = module.NewsPipeline(
-        config, store, run, http_client=client, queue_client=FakeQueue()
+        config,
+        store,
+        run,
+        visuals="cloud",
+        frame_gate=False,
+        http_client=client,
+        queue_client=FakeQueue(),
     )
     try:
         pipeline.generate_first_frames()
@@ -357,4 +367,379 @@ def test_queue_media_stages_use_required_job_types_and_roles(
         "voiceover",
         "captions",
     }
+    assert queue.submissions[2]["payload"]["input_fps"] == 16
+    assert queue.submissions[2]["payload"]["fps_out"] == 30
+    assert (
+        queue.submissions[2]["payload"]["pre_caption_video_filter"]
+        == "minterpolate=fps=30"
+    )
     assert store.get_run(run["id"])["status"] == "assembled"
+
+
+def test_default_preset_loads_and_cli_defaults_local() -> None:
+    preset = module.PipelineConfig.load(module.DEFAULT_PRESET_PATH)
+    args = module.build_parser().parse_args([])
+
+    assert preset.frame_model == "flux2_klein"
+    assert preset.video_mode == "i2v"
+    assert preset.fps_out == 30
+    assert args.visuals == "local"
+    assert args.frame_gate is True
+
+
+def test_local_visuals_enqueue_frame_and_video_jobs(tmp_path: Path) -> None:
+    config = settings(tmp_path)
+    store = module.StateStore(config.database_path)
+    run = store.create_run("test")
+    shots = [
+        {
+            "voiceover_text": f"Voice {index}",
+            "motion_instruction": "slow push-in",
+            "video_mode": "i2v",
+            "first_frame_prompt": f"Frame {index}",
+            "last_frame_prompt": None,
+        }
+        for index in range(1, 6)
+    ]
+    run = store.update_run(
+        run["id"],
+        status="scripted",
+        story_json="{}",
+        script_json=json.dumps({"shots": shots}),
+    )
+    queue = RecordingQueue()
+    pipeline = module.NewsPipeline(
+        config,
+        store,
+        run,
+        config=module.PipelineConfig(),
+        visuals="local",
+        frame_gate=False,
+        queue_client=queue,
+    )
+    try:
+        pipeline.generate_first_frames()
+        pipeline.generate_clips()
+    finally:
+        pipeline.close()
+
+    assert [job["job_type"] for job in queue.submissions] == [
+        *(["frame"] * 5),
+        *(["video"] * 5),
+    ]
+    frame_job = queue.submissions[0]
+    assert frame_job["payload"]["workflow"] == "flux2_klein"
+    assert frame_job["payload"]["steps"] == 4
+    assert isinstance(frame_job["payload"]["seed"], int)
+    assert frame_job["payload"]["prompt"].startswith(module.DEFAULT_STYLE_BLOCK)
+    assert all(set(job["input_files"]) == {"frame"} for job in queue.submissions[5:])
+
+
+def test_flf_uses_two_approved_frames_per_video(tmp_path: Path) -> None:
+    config = settings(tmp_path)
+    preset = module.PipelineConfig(video_mode="flf")
+    store = module.StateStore(config.database_path)
+    run = store.create_run("test")
+    shots = [
+        {
+            "voiceover_text": f"Voice {index}",
+            "motion_instruction": "gentle pan left",
+            "video_mode": "flf",
+            "first_frame_prompt": f"Opening {index}",
+            "last_frame_prompt": f"Ending {index}",
+        }
+        for index in range(1, 6)
+    ]
+    run = store.update_run(
+        run["id"],
+        status="scripted",
+        story_json="{}",
+        script_json=json.dumps({"shots": shots}),
+    )
+    queue = RecordingQueue()
+    pipeline = module.NewsPipeline(
+        config,
+        store,
+        run,
+        config=preset,
+        visuals="local",
+        frame_gate=True,
+        queue_client=queue,
+    )
+    try:
+        pipeline.generate_first_frames()
+        with pytest.raises(RuntimeError, match="until every frame is approved"):
+            pipeline.generate_clips()
+        state = json.loads(store.get_run(run["id"])["frame_gate_json"])
+        for frame in state["frames"]:
+            frame["status"] = "approved"
+        store.update_run(run["id"], frame_gate_json=json.dumps(state))
+        pipeline.generate_clips()
+    finally:
+        pipeline.close()
+
+    assert [job["job_type"] for job in queue.submissions[:10]] == ["frame"] * 10
+    assert all(
+        set(job["input_files"]) == {"first_frame", "last_frame"}
+        for job in queue.submissions[10:]
+    )
+
+
+def test_frame_regeneration_only_requeues_selected_frame_with_new_seed(
+    tmp_path: Path,
+) -> None:
+    config = settings(tmp_path)
+    store = module.StateStore(config.database_path)
+    run = store.create_run("test")
+    shots = [
+        {
+            "voiceover_text": f"Voice {index}",
+            "motion_instruction": "slow push-in",
+            "video_mode": "i2v",
+            "first_frame_prompt": f"Frame {index}",
+        }
+        for index in range(1, 6)
+    ]
+    run = store.update_run(
+        run["id"],
+        status="scripted",
+        story_json="{}",
+        script_json=json.dumps({"shots": shots}),
+    )
+    queue = RecordingQueue()
+    pipeline = module.NewsPipeline(
+        config,
+        store,
+        run,
+        visuals="local",
+        frame_gate=True,
+        queue_client=queue,
+    )
+    try:
+        pipeline.generate_first_frames()
+        state = json.loads(store.get_run(run["id"])["frame_gate_json"])
+        for index, frame in enumerate(state["frames"], start=1):
+            frame["album_message_id"] = str(index)
+            frame["control_message_id"] = str(100 + index)
+        state["chat_id"] = "123"
+        state["album_message_ids"] = [str(index) for index in range(1, 6)]
+        store.update_run(run["id"], frame_gate_json=json.dumps(state))
+        original_seed = state["frames"][1]["seed"]
+        selected_path = Path(state["frames"][1]["path"])
+        store.record_frame_approval(run["id"], 2, 0, "regenerate", 999, "7")
+        persisted = store.pending_frame_approval(run["id"])
+        assert persisted is not None
+        pipeline._process_frame_approval(persisted)
+        assert not selected_path.exists()
+        pipeline._edit_frame_album_item = lambda *_: None
+        pipeline._send_frame_control = lambda *_: None
+        pipeline.wait_for_frame_approval = lambda: None
+        assert pipeline.run_frame_gate() is False
+    finally:
+        pipeline.close()
+
+    updated = json.loads(store.get_run(run["id"])["frame_gate_json"])
+    assert len(queue.submissions) == 6
+    assert queue.submissions[-1]["job_type"] == "frame"
+    assert updated["frames"][1]["seed"] != original_seed
+    assert updated["frames"][1]["generation"] == 1
+    assert updated["frames"][1]["status"] == "pending"
+    assert selected_path.is_file()
+
+
+def test_frame_album_and_controls_are_not_resent_after_restart(
+    tmp_path: Path,
+) -> None:
+    class TelegramPipeline(module.NewsPipeline):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.telegram_calls = []
+
+        def _telegram_api(self, method, **kwargs):
+            self.telegram_calls.append((method, kwargs))
+            if method == "sendMediaGroup":
+                return {
+                    "ok": True,
+                    "result": [{"message_id": index} for index in range(1, 6)],
+                }
+            if method == "sendMessage":
+                return {
+                    "ok": True,
+                    "result": {"message_id": 100 + len(self.telegram_calls)},
+                }
+            raise AssertionError(f"unexpected Telegram method: {method}")
+
+    config = settings(tmp_path)
+    store = module.StateStore(config.database_path)
+    run = store.create_run("test")
+    shots = [
+        {
+            "voiceover_text": f"Voice {index}",
+            "motion_instruction": "slow push-in",
+            "video_mode": "i2v",
+            "first_frame_prompt": f"Frame {index}",
+        }
+        for index in range(1, 6)
+    ]
+    run = store.update_run(
+        run["id"],
+        status="scripted",
+        story_json="{}",
+        script_json=json.dumps({"shots": shots}),
+    )
+    queue = RecordingQueue()
+    first = TelegramPipeline(
+        config,
+        store,
+        run,
+        visuals="local",
+        frame_gate=True,
+        queue_client=queue,
+    )
+    try:
+        first.generate_first_frames()
+        first.request_frame_approval()
+    finally:
+        first.close()
+
+    assert [call[0] for call in first.telegram_calls] == [
+        "sendMediaGroup",
+        *(["sendMessage"] * 5),
+    ]
+    resumed = TelegramPipeline(
+        config,
+        store,
+        store.get_run(run["id"]),
+        visuals="local",
+        frame_gate=True,
+        queue_client=queue,
+    )
+    try:
+        resumed.request_frame_approval()
+    finally:
+        resumed.close()
+
+    assert resumed.telegram_calls == []
+
+
+def test_script_normalizes_motion_mode_and_verbatim_style(tmp_path: Path) -> None:
+    style = "ARCHIVAL COLLAGE — "
+    response_script = {
+        "title": "Title",
+        "description": "Description",
+        "shots": [
+            {
+                "voiceover_text": f"Voice {index}",
+                "motion_instruction": "slow push-in",
+                "video_mode": "i2v",
+                "first_frame_prompt": f"Subject {index}",
+                "last_frame_prompt": None,
+            }
+            for index in range(1, 6)
+        ],
+    }
+    request_payload = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        request_payload.update(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": json.dumps(response_script)}}]},
+        )
+
+    config = settings(tmp_path)
+    store = module.StateStore(config.database_path)
+    run = store.create_run("test")
+    run = store.update_run(
+        run["id"],
+        status="fetched",
+        story_json=json.dumps({"title": "Story", "summary": "Summary", "sources": []}),
+    )
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    pipeline = module.NewsPipeline(
+        config,
+        store,
+        run,
+        config=module.PipelineConfig(style_block=style, video_mode="auto"),
+        visuals="cloud",
+        frame_gate=False,
+        http_client=client,
+        queue_client=FakeQueue(),
+    )
+    try:
+        pipeline.write_script()
+    finally:
+        pipeline.close()
+        client.close()
+
+    script = json.loads(store.get_run(run["id"])["script_json"])
+    assert all(shot["first_frame_prompt"].startswith(style) for shot in script["shots"])
+    assert all(shot["motion_instruction"] == "slow push-in" for shot in script["shots"])
+    assert "Exactly one short camera move" in request_payload["messages"][1]["content"]
+
+
+def test_run_configuration_is_snapshotted_for_resume(tmp_path: Path) -> None:
+    store = module.StateStore(tmp_path / "pipeline.sqlite3")
+    run = store.create_run("test")
+    first = module.PipelineConfig(style_block="FIRST ", fps_out=30)
+    run, _, visuals, frame_gate = module.configure_run(
+        store,
+        run,
+        config=first,
+        visuals="local",
+        frame_gate=False,
+    )
+    _, resumed, resumed_visuals, resumed_gate = module.configure_run(
+        store,
+        run,
+        config=module.PipelineConfig(style_block="CHANGED ", fps_out=60),
+        visuals="cloud",
+        frame_gate=True,
+    )
+
+    assert visuals == "local"
+    assert frame_gate is False
+    assert resumed.style_block == "FIRST "
+    assert resumed.fps_out == 30
+    assert resumed_visuals == "local"
+    assert resumed_gate is False
+
+
+def test_cloud_startup_requires_xai_key_before_pipeline_activity(
+    tmp_path: Path,
+) -> None:
+    config = replace(settings(tmp_path), xai_api_key="")
+
+    with pytest.raises(
+        RuntimeError,
+        match="before any API spend or queue activity",
+    ):
+        module.validate_startup(config, "cloud")
+
+    module.validate_startup(config, "local")
+
+
+def test_cloud_cli_fails_before_creating_state_without_xai_key(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = replace(settings(tmp_path), xai_api_key="")
+    monkeypatch.setattr(module, "load_environment", lambda _: None)
+    monkeypatch.setattr(
+        module.Settings,
+        "from_environment",
+        classmethod(lambda cls, *args, **kwargs: config),
+    )
+
+    result = module.main(
+        [
+            "--new",
+            "--visuals",
+            "cloud",
+            "--config",
+            str(module.DEFAULT_PRESET_PATH),
+        ]
+    )
+
+    assert result == 2
+    assert not config.database_path.exists()

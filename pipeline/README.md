@@ -6,13 +6,17 @@ news video.
 ## Run
 
 Copy `.env.example` to `/home/alireza/content-factory/pipeline/.env` and set
-`XAI_API_KEY`, `OPENAI_API_KEY`, `TELEGRAM_BOT_TOKEN`, and
-`TELEGRAM_CHAT_ID`, then:
+`XAI_API_KEY`, `TELEGRAM_BOT_TOKEN`, and `TELEGRAM_CHAT_ID`, then:
 
 ```bash
 cd /home/alireza/content-factory/pipeline
 ./.venv/bin/python news_pipeline.py --new --topic "AI infrastructure news"
 ```
+
+Visuals default to the local DGX queue. To use `gpt-image-1` for frames and
+xAI Imagine for video, also set `OPENAI_API_KEY` and run with
+`--visuals cloud`. Cloud startup fails before model or queue activity when
+`XAI_API_KEY` is absent.
 
 Resume the newest non-terminal run:
 
@@ -26,17 +30,27 @@ Resume a specific run:
 ./.venv/bin/python news_pipeline.py --run-id <uuid>
 ```
 
-Cheap validation stops after the five low-quality portrait first frames:
+Cheap validation stops after frame generation, before Telegram frame approval:
 
 ```bash
 ./.venv/bin/python news_pipeline.py --new --dry-run
 ```
 
+The frame gate is enabled by default. `--no-frame-gate` skips it.
+
+## Presets
+
+Every new run reads `../config/presets.yaml` and snapshots the resolved values
+in SQLite so a later edit cannot change a resumed run. The human-editable
+preset controls the verbatim frame-prompt `style_block`, local frame workflow,
+I2V/first-last-frame selection, resolution, draft/final steps, negative prompt,
+and output FPS.
+
 ## State machine
 
 The successful-stage states are:
 
-`fetched → scripted → framed → rendered → voiced → assembled →
+`fetched → scripted → framed (frame gate) → rendered → voiced → assembled →
 pending_approval → published|rejected`
 
 A newly-created row has a null state until `fetch_story` succeeds. SQLite is
@@ -44,20 +58,30 @@ in WAL mode. State advances only after a complete stage, generated files use
 atomic replacement, Imagine request IDs and queue job IDs are persisted before
 polling, and a restart resumes the newest unfinished run.
 
-Each stage retries at most three times with exponential backoff. Regenerate
-deletes generated media, rewinds to `scripted`, and reruns frames onward.
+Each stage retries at most three times with exponential backoff. Frame
+approval, generation number, seed, album/control message IDs, and callbacks are
+persisted per frame. A frame Regenerate action changes its seed and requeues
+only that frame. Final-video Regenerate deletes generated media, rewinds to
+`scripted`, and reruns frames onward.
 
 ## DGX queue jobs
 
+- `frame`: no input files; payload contains the configured worker workflow,
+  prompt, negative prompt, resolution, draft steps, and seed.
+- `video`: input role `frame` for I2V, or `first_frame` and `last_frame` for
+  first/last-frame mode; payload contains the motion instruction, resolution,
+  final steps, and seed.
 - `tts`: payload contains the combined narration and five timed shot entries;
   result is downloaded to `voiceover.wav`. The selected `TTS_VOICE_PRESET`
   adds the worker contract fields `voice_ref` and `voice_ref_text`.
 - `transcribe`: input role `audio`, result downloaded to `captions.srt`.
 - `assemble`: input roles `clip_1` through `clip_5`, `voiceover`, and
-  `captions`; result downloaded to `final.mp4`.
+  `captions`; 16fps clips pass through ffmpeg `minterpolate` to the configured
+  `fps_out` before caption burn, and the result is downloaded to `final.mp4`.
 
-Grok and OpenAI requests execute directly on the VPS. Only the three media
-jobs above are sent to the queue.
+Story research and script generation execute directly on the VPS. In local
+visual mode all five job types above use the queue; in cloud visual mode only
+TTS, transcription, and assembly use it.
 
 The queue client is imported from the sibling `../queue` directory by default.
 `JOB_QUEUE_CLIENT_ROOT` can override that location for development.
@@ -71,8 +95,10 @@ required.
 
 ## Approval
 
-The pipeline uploads the final MP4 and metadata through the configured Telegram
-bot with Approve, Reject, and Regenerate buttons. It long-polls callback
-updates, persists the update offset and decision before acting, and therefore
-survives a crash at the approval gate. `publish()` currently writes a local
-stub receipt and performs no platform upload.
+After frames finish, the default frame gate uploads them as a Telegram album
+and posts one Approve/Regenerate control message per frame. Video for a shot is
+not queued until all of that shot's frames are approved. The pipeline later
+uploads the final MP4 and metadata with Approve, Reject, and Regenerate
+buttons. Both gates persist callback decisions before acting and therefore
+resume after a crash. `publish()` currently writes a local stub receipt and
+performs no platform upload.

@@ -20,7 +20,7 @@ port. The hosts currently have a direct Tailscale path on the local network.
 | VPS | `job-queue.service` | `100.123.208.90:8787` | FastAPI queue, SQLite state, input/result files |
 | VPS | `hermes-webui.service` | `100.123.208.90:8788` | Hermes browser UI |
 | VPS | `hermes-serve.service` | `100.123.208.90:9119` | Existing Hermes backend |
-| DGX | worker process | outbound to VPS `:8787` | TTS, transcription, and assembly |
+| DGX | worker process | outbound to VPS `:8787` | Local visuals, TTS, transcription, and assembly |
 
 UFW permits TCP 8787 and 8788 only from the Tailscale CGNAT range. External
 xAI, OpenAI, and Telegram requests leave the VPS over HTTPS (TCP 443).
@@ -36,21 +36,21 @@ again. Claim tokens prevent an expired worker from completing a re-claimed job.
 flowchart LR
     subgraph VPS["VPS mini · 100.123.208.90"]
         P["news_pipeline.py<br/>fetched → scripted → framed → rendered"]
-        X["xAI APIs<br/>live search, script, video"]
-        O["OpenAI Images API<br/>first frames"]
+        X["xAI APIs<br/>live search, script, cloud video"]
+        O["OpenAI Images API<br/>cloud frames"]
         Q["FastAPI queue :8787<br/>SQLite + files"]
         A["voiced → assembled<br/>pending_approval"]
-        T["Hermes Telegram bot<br/>Approve / Reject / Regenerate"]
+        T["Telegram gates<br/>per-frame + final approval"]
         U["publish() stub<br/>published / rejected"]
     end
 
     subgraph DGX["DGX aitopatom-c85a · 100.103.129.82"]
-        W["Polling worker<br/>tts → transcribe → assemble"]
+        W["Polling worker<br/>frame → video → tts → transcribe → assemble"]
     end
 
     P --> X
     P --> O
-    P -->|POST tts / transcribe / assemble| Q
+    P -->|local visuals + media jobs| Q
     W -->|poll + claim| Q
     Q -->|download inputs| W
     W -->|upload result / failure| Q
@@ -60,8 +60,9 @@ flowchart LR
     T -->|regenerate| P
 ```
 
-Only `tts`, `transcribe`, and `assemble` cross the tailnet queue boundary.
-Grok/OpenAI calls, pipeline state, and the approval gate remain on the VPS.
+Local `frame` and `video` jobs plus `tts`, `transcribe`, and `assemble` cross
+the tailnet queue boundary. Cloud visual mode sends frames to OpenAI and video
+to xAI instead. Pipeline state and both approval gates remain on the VPS.
 
 ## Model roster
 
@@ -69,14 +70,16 @@ Grok/OpenAI calls, pipeline state, and the approval gate remain on the VPS.
 | --- | --- | --- | --- |
 | Story discovery and scoring | VPS | xAI `grok-4.5` | Chat completions with live search |
 | Five-shot script | VPS | xAI `grok-4.5` | Structured 50-second Shorts script |
-| First frames | VPS | OpenAI `gpt-image-1` | One 9:16 image per shot |
-| Video clips | VPS | xAI `grok-imagine-video` | Image-to-video, 10 seconds, 9:16 |
+| Frames (local default) | DGX | preset `flux2_klein` workflow | One I2V frame or first/last pair per shot |
+| Frames (cloud) | VPS | OpenAI `gpt-image-1` | 9:16 images |
+| Video clips (local default) | DGX | worker-configured workflow | I2V or first/last-frame, 10 seconds, 9:16 |
+| Video clips (cloud) | VPS | xAI `grok-imagine-video` | 10 seconds, 9:16 |
 | Voiceover | DGX | worker-configured, pending sync | Queue type `tts` |
 | Captions | DGX | worker-configured, pending sync | Queue type `transcribe` |
-| Assembly | DGX | media toolchain, pending sync | Queue type `assemble`; no hosted model required |
+| Assembly | DGX | ffmpeg | `minterpolate` from 16fps to preset `fps_out`, then caption burn |
 
-The selected VPS models are environment-configurable. DGX model names remain
-explicitly uncommitted until its worker files are synchronized.
+Cloud models remain environment-configurable. Local visual and assembly
+settings come from `config/presets.yaml` and are snapshotted per run.
 
 ## Deployment
 
