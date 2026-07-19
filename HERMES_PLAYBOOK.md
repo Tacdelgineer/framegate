@@ -125,9 +125,12 @@ improvise.
 ## Presets tier
 
 Edit presets only when the user asks for a style, model, or setting change.
-Limit changes to `style_block`, `frame_model`, `video_mode`,
+Limit changes to `script_provider.base_url`, `script_provider.model`,
+`script_provider.api_key_env`, `style_block`, `frame_model`, `video_mode`,
 `video_resolution`, `steps_draft`, `steps_final`, `fps_out`, and
-`negative_prompt`.
+`negative_prompt`. The script provider is independent of `--visuals`;
+changing one never implies changing the other. Use `api_key_env: null` for
+keyless Ollama, `XAI_API_KEY` for xAI, or `OPENAI_API_KEY` for OpenAI.
 
 1. Read `/home/alireza/content-factory/config/presets.yaml`.
 2. Prepare a before/after unified diff without writing any file.

@@ -10,8 +10,9 @@ All service-to-service traffic stays inside the Tailscale tailnet
 | `mini` | VPS control plane, model APIs, state, approval, and Web UI | `100.123.208.90` |
 | `aitopatom-c85a` | DGX media worker | `100.103.129.82` |
 
-The DGX makes outbound polling requests to the VPS; it needs no inbound worker
-port. The hosts currently have a direct Tailscale path on the local network.
+The DGX worker makes outbound polling requests to the VPS. Its Ollama service
+accepts script-provider requests from the VPS over Tailscale. The hosts
+currently have a direct Tailscale path on the local network.
 
 ## Services and ports
 
@@ -21,6 +22,7 @@ port. The hosts currently have a direct Tailscale path on the local network.
 | VPS | `hermes-webui.service` | `100.123.208.90:8788` | Hermes browser UI |
 | VPS | `hermes-serve.service` | `100.123.208.90:9119` | Existing Hermes backend |
 | DGX | worker process | outbound to VPS `:8787` | Local visuals, TTS, transcription, and assembly |
+| DGX | Ollama | `100.103.129.82:11434` | Default OpenAI-compatible content brief and script provider |
 
 UFW permits TCP 8787 and 8788 only from the Tailscale CGNAT range. External
 xAI, OpenAI, and Telegram requests leave the VPS over HTTPS (TCP 443).
@@ -36,7 +38,8 @@ again. Claim tokens prevent an expired worker from completing a re-claimed job.
 flowchart LR
     subgraph VPS["VPS mini · 100.123.208.90"]
         P["news_pipeline.py<br/>fetched → scripted → framed → rendered"]
-        X["xAI APIs<br/>live search, script, cloud video"]
+        X["Optional hosted script API<br/>xAI or OpenAI"]
+        V["xAI API<br/>cloud video"]
         O["OpenAI Images API<br/>cloud frames"]
         Q["FastAPI queue :8787<br/>SQLite + files"]
         A["voiced → assembled<br/>pending_approval"]
@@ -45,10 +48,13 @@ flowchart LR
     end
 
     subgraph DGX["DGX aitopatom-c85a · 100.103.129.82"]
+        L["Ollama :11434<br/>Qwen content brief + script"]
         W["Polling worker<br/>frame → video → tts → transcribe → assemble"]
     end
 
-    P --> X
+    P --> L
+    P -. preset alternative .-> X
+    P --> V
     P --> O
     P -->|local visuals + media jobs| Q
     W -->|poll + claim| Q
@@ -68,8 +74,8 @@ to xAI instead. Pipeline state and both approval gates remain on the VPS.
 
 | Stage | Machine | Provider/model | Notes |
 | --- | --- | --- | --- |
-| Story discovery and scoring | VPS | xAI `grok-4.5` | Chat completions with live search |
-| Five-shot script | VPS | xAI `grok-4.5` | Structured 50-second Shorts script |
+| Evergreen content brief | DGX via VPS | Ollama `qwen3.6:35b-a3b` | Default keyless OpenAI-compatible chat completions |
+| Five-shot script | DGX via VPS | Ollama `qwen3.6:35b-a3b` | Structured 50-second explainer; hosted provider optional |
 | Frames (local default) | DGX | preset `flux2_klein` workflow | One I2V frame or first/last pair per shot |
 | Frames (cloud) | VPS | OpenAI `gpt-image-1` | 9:16 images |
 | Video clips (local default) | DGX | worker-configured workflow | I2V or first/last-frame, 10 seconds, 9:16 |
@@ -78,8 +84,10 @@ to xAI instead. Pipeline state and both approval gates remain on the VPS.
 | Captions | DGX | worker-configured, pending sync | Queue type `transcribe` |
 | Assembly | DGX | ffmpeg | `minterpolate` from 16fps to preset `fps_out`, then caption burn |
 
-Cloud models remain environment-configurable. Local visual and assembly
-settings come from `config/presets.yaml` and are snapshotted per run.
+The script provider and local visual/assembly settings come from
+`config/presets.yaml` and are snapshotted per run. Hosted script providers use
+the optional configured key environment variable. Cloud visual models remain
+environment-configurable and independent from the script provider.
 
 ## Deployment
 

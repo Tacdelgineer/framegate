@@ -53,7 +53,6 @@ def settings(tmp_path: Path) -> module.Settings:
         queue_url="http://queue",
         xai_api_key="xai-test",
         openai_api_key="openai-test",
-        xai_text_model="grok-test",
         openai_image_model="gpt-image-1",
         openai_image_quality="low",
         video_model="grok-imagine-video",
@@ -207,36 +206,44 @@ def test_choose_run_resumes_unfinished_unless_new(tmp_path: Path) -> None:
     assert second["topic"] == "second"
 
 
-def test_fetch_story_uses_xai_chat_live_search(tmp_path: Path) -> None:
+def test_fetch_story_uses_keyless_ollama_and_strips_think_block(
+    tmp_path: Path,
+) -> None:
     captured = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
-        captured.update(json.loads(request.content))
-        story = {
-            "title": "Verified story",
-            "summary": "Summary",
+        captured["url"] = str(request.url)
+        captured["authorization"] = request.headers.get("Authorization")
+        captured["payload"] = json.loads(request.content)
+        brief = {
+            "title": "Evergreen explainer",
+            "summary": "A durable explanation of the topic.",
             "why_it_matters": "Reason",
-            "score": 91,
-            "score_breakdown": {
-                "recency": 95,
-                "impact": 90,
-                "visual_potential": 85,
-                "source_confidence": 94,
-            },
-            "sources": [
-                {"title": "A", "url": "https://a.test"},
-                {"title": "B", "url": "https://b.test"},
-            ],
+            "audience": "Curious viewers",
+            "angle": "Explain the hidden mechanism",
+            "key_points": ["First", "Second", "Third"],
         }
         return httpx.Response(
             200,
             json={
-                "choices": [{"message": {"content": json.dumps(story)}}],
-                "citations": ["https://a.test", "https://b.test"],
+                "choices": [
+                    {
+                        "message": {
+                            "content": (
+                                "<think>private chain of thought</think>\n"
+                                + json.dumps(brief)
+                            )
+                        }
+                    }
+                ],
             },
         )
 
-    config = settings(tmp_path)
+    config = replace(
+        settings(tmp_path),
+        xai_api_key="",
+        openai_api_key="",
+    )
     store = module.StateStore(config.database_path)
     run = store.create_run("test")
     client = httpx.Client(transport=httpx.MockTransport(handler))
@@ -244,7 +251,7 @@ def test_fetch_story_uses_xai_chat_live_search(tmp_path: Path) -> None:
         config,
         store,
         run,
-        visuals="cloud",
+        visuals="local",
         frame_gate=False,
         http_client=client,
         queue_client=FakeQueue(),
@@ -255,10 +262,83 @@ def test_fetch_story_uses_xai_chat_live_search(tmp_path: Path) -> None:
         pipeline.close()
         client.close()
 
-    assert captured["model"] == "grok-test"
-    assert captured["search_parameters"]["mode"] == "on"
-    assert captured["search_parameters"]["return_citations"] is True
-    assert store.get_run(run["id"])["status"] == "fetched"
+    assert captured["url"] == "http://100.103.129.82:11434/v1/chat/completions"
+    assert captured["authorization"] is None
+    assert captured["payload"]["model"] == "qwen3.6:35b-a3b"
+    assert "search_parameters" not in captured["payload"]
+    assert (
+        "Treat the topic as the complete editorial brief"
+        in captured["payload"]["messages"][1]["content"]
+    )
+    stored = store.get_run(run["id"])
+    assert stored["status"] == "fetched"
+    assert json.loads(stored["story_json"])["title"] == "Evergreen explainer"
+
+
+@pytest.mark.parametrize(
+    ("base_url", "model", "key_env", "api_key"),
+    [
+        ("https://api.x.ai/v1", "grok-test", "XAI_API_KEY", "xai-selected"),
+        (
+            "https://api.openai.com/v1",
+            "openai-test",
+            "OPENAI_API_KEY",
+            "openai-selected",
+        ),
+    ],
+)
+def test_script_provider_selection_uses_configured_endpoint_and_key(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    base_url: str,
+    model: str,
+    key_env: str,
+    api_key: str,
+) -> None:
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        captured["authorization"] = request.headers.get("Authorization")
+        captured["payload"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": '{"ok": true}'}}]},
+        )
+
+    monkeypatch.setenv(key_env, api_key)
+    config = settings(tmp_path)
+    store = module.StateStore(config.database_path)
+    run = store.create_run("test")
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    pipeline = module.NewsPipeline(
+        config,
+        store,
+        run,
+        config=module.PipelineConfig(
+            script_provider=module.ScriptProviderConfig(
+                base_url=base_url,
+                model=model,
+                api_key_env=key_env,
+            )
+        ),
+        visuals="local",
+        http_client=client,
+        queue_client=FakeQueue(),
+    )
+    try:
+        result, _ = pipeline._script_chat(
+            system_prompt="Return JSON.",
+            user_prompt="Test.",
+        )
+    finally:
+        pipeline.close()
+        client.close()
+
+    assert result == {"ok": True}
+    assert captured["url"] == f"{base_url}/chat/completions"
+    assert captured["authorization"] == f"Bearer {api_key}"
+    assert captured["payload"]["model"] == model
 
 
 def test_first_frames_use_gpt_image_1_portrait_contract(tmp_path: Path) -> None:
@@ -380,6 +460,9 @@ def test_default_preset_loads_and_cli_defaults_local() -> None:
     preset = module.PipelineConfig.load(module.DEFAULT_PRESET_PATH)
     args = module.build_parser().parse_args([])
 
+    assert preset.script_provider.base_url == "http://100.103.129.82:11434/v1"
+    assert preset.script_provider.model == "qwen3.6:35b-a3b"
+    assert preset.script_provider.api_key_env is None
     assert preset.frame_model == "flux2_klein"
     assert preset.video_mode == "i2v"
     assert preset.fps_out == 30
@@ -805,7 +888,15 @@ def test_script_normalizes_motion_mode_and_verbatim_style(tmp_path: Path) -> Non
 def test_run_configuration_is_snapshotted_for_resume(tmp_path: Path) -> None:
     store = module.StateStore(tmp_path / "pipeline.sqlite3")
     run = store.create_run("test")
-    first = module.PipelineConfig(style_block="FIRST ", fps_out=30)
+    first = module.PipelineConfig(
+        script_provider=module.ScriptProviderConfig(
+            base_url="https://api.openai.com/v1",
+            model="openai-test",
+            api_key_env="OPENAI_API_KEY",
+        ),
+        style_block="FIRST ",
+        fps_out=30,
+    )
     run, _, visuals, frame_gate = module.configure_run(
         store,
         run,
@@ -825,6 +916,9 @@ def test_run_configuration_is_snapshotted_for_resume(tmp_path: Path) -> None:
     assert frame_gate is False
     assert resumed.style_block == "FIRST "
     assert resumed.fps_out == 30
+    assert resumed.script_provider.base_url == "https://api.openai.com/v1"
+    assert resumed.script_provider.model == "openai-test"
+    assert resumed.script_provider.api_key_env == "OPENAI_API_KEY"
     assert resumed_visuals == "local"
     assert resumed_gate is False
 
@@ -833,14 +927,42 @@ def test_cloud_startup_requires_xai_key_before_pipeline_activity(
     tmp_path: Path,
 ) -> None:
     config = replace(settings(tmp_path), xai_api_key="")
+    preset = module.PipelineConfig()
 
     with pytest.raises(
         RuntimeError,
         match="before any API spend or queue activity",
     ):
-        module.validate_startup(config, "cloud")
+        module.validate_startup(config, "cloud", preset)
 
-    module.validate_startup(config, "local")
+    module.validate_startup(config, "local", preset)
+
+
+def test_script_provider_key_requirement_is_independent_of_visuals(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("XAI_API_KEY", raising=False)
+    config = replace(settings(tmp_path), xai_api_key="")
+    xai_script = module.PipelineConfig(
+        script_provider=module.ScriptProviderConfig(
+            base_url="https://api.x.ai/v1",
+            model="grok-test",
+            api_key_env="XAI_API_KEY",
+        )
+    )
+    openai_script = module.PipelineConfig(
+        script_provider=module.ScriptProviderConfig(
+            base_url="https://api.openai.com/v1",
+            model="openai-test",
+            api_key_env="OPENAI_API_KEY",
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="required by the selected script_provider"):
+        module.validate_startup(config, "local", xai_script)
+
+    module.validate_startup(config, "local", openai_script)
 
 
 def test_cloud_cli_fails_before_creating_state_without_xai_key(

@@ -1,22 +1,22 @@
 # News pipeline
 
 Crash-resumable, SQLite-backed production of a five-shot, 50-second vertical
-news video.
+evergreen explainer video.
 
 ## Run
 
 Copy `.env.example` to `/home/alireza/content-factory/pipeline/.env` and set
-`XAI_API_KEY`, `TELEGRAM_BOT_TOKEN`, and `TELEGRAM_CHAT_ID`, then:
+`TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`, then:
 
 ```bash
 cd /home/alireza/content-factory/pipeline
 ./.venv/bin/python news_pipeline.py --new --topic "AI infrastructure news"
 ```
 
-Visuals default to the local DGX queue. To use `gpt-image-1` for frames and
-xAI Imagine for video, also set `OPENAI_API_KEY` and run with
-`--visuals cloud`. Cloud startup fails before model or queue activity when
-`XAI_API_KEY` is absent.
+The default script provider is the DGX Ollama OpenAI-compatible endpoint, and
+visuals default to the local DGX queue, so the default content path requires no
+model API key. To use `gpt-image-1` for frames and xAI Imagine for video, set
+`OPENAI_API_KEY` and `XAI_API_KEY` and run with `--visuals cloud`.
 
 Resume the newest non-terminal run:
 
@@ -44,7 +44,13 @@ Every new run reads `../config/presets.yaml` and snapshots the resolved values
 in SQLite so a later edit cannot change a resumed run. The human-editable
 preset controls the verbatim frame-prompt `style_block`, local frame workflow,
 I2V/first-last-frame selection, resolution, draft/final steps, negative prompt,
-and output FPS.
+output FPS, and the independent OpenAI-compatible `script_provider`.
+
+`script_provider` contains `base_url`, `model`, and optional `api_key_env`.
+Use `https://api.x.ai/v1` with `XAI_API_KEY` for xAI, or
+`https://api.openai.com/v1` with `OPENAI_API_KEY` for OpenAI. A selected key
+environment variable must be configured before a run starts. `--visuals` does
+not select or alter the script provider.
 
 ## State machine
 
@@ -53,10 +59,11 @@ The successful-stage states are:
 `fetched → scripted → framed (frame gate) → rendered → voiced → assembled →
 pending_approval → published|rejected`
 
-A newly-created row has a null state until `fetch_story` succeeds. SQLite is
-in WAL mode. State advances only after a complete stage, generated files use
-atomic replacement, Imagine request IDs and queue job IDs are persisted before
-polling, and a restart resumes the newest unfinished run.
+A newly-created row has a null state until `fetch_story` turns its topic into
+an evergreen content brief. SQLite is in WAL mode. State advances only after a
+complete stage, generated files use atomic replacement, Imagine request IDs
+and queue job IDs are persisted before polling, and a restart resumes the
+newest unfinished run.
 
 Each stage retries at most three times with exponential backoff. Frame
 approval, generation number, seed, album/control message IDs, and callbacks are
@@ -79,9 +86,10 @@ only that frame. Final-video Regenerate deletes generated media, rewinds to
   `captions`; 16fps clips pass through ffmpeg `minterpolate` to the configured
   `fps_out` before caption burn, and the result is downloaded to `final.mp4`.
 
-Story research and script generation execute directly on the VPS. In local
-visual mode all five job types above use the queue; in cloud visual mode only
-TTS, transcription, and assembly use it.
+Content-brief and script generation call the preset's OpenAI-compatible
+provider directly from the VPS. In local visual mode all five job types above
+use the queue; in cloud visual mode only TTS, transcription, and assembly use
+it.
 
 The queue client is imported from the sibling `../queue` directory by default.
 `JOB_QUEUE_CLIENT_ROOT` can override that location for development.

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Crash-resumable short-form news video pipeline.
+"""Crash-resumable short-form evergreen explainer video pipeline.
 
 Expensive model calls remain on the VPS. GPU/media stages are transferred to a
 DGX worker through the Tailscale job queue.
@@ -20,7 +20,7 @@ import sys
 import time
 import uuid
 from contextlib import ExitStack
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -60,7 +60,6 @@ STATUS_INDEX = {status: index for index, status in enumerate(STATUSES)}
 TERMINAL_STATUSES = {"published", "rejected"}
 SHOT_COUNT = 5
 
-XAI_CHAT_URL = "https://api.x.ai/v1/chat/completions"
 XAI_VIDEO_CREATE_URL = "https://api.x.ai/v1/videos/generations"
 XAI_VIDEO_STATUS_URL = "https://api.x.ai/v1/videos/{request_id}"
 OPENAI_IMAGE_URL = "https://api.openai.com/v1/images/generations"
@@ -69,6 +68,8 @@ DEFAULT_PRESET_PATH = MONOREPO_ROOT / "config" / "presets.yaml"
 VISUAL_BACKENDS = {"local", "cloud"}
 VIDEO_MODES = {"i2v", "flf", "auto"}
 DEFAULT_STYLE_BLOCK = "Cinematic news documentary photography, realistic lighting. "
+DEFAULT_SCRIPT_BASE_URL = "http://100.103.129.82:11434/v1"
+DEFAULT_SCRIPT_MODEL = "qwen3.6:35b-a3b"
 
 VOICE_PRESETS = {
     "alireza": {
@@ -122,6 +123,15 @@ def parse_json_text(text: str) -> Any:
         raise ValueError("Model response did not contain valid JSON")
 
 
+def strip_think_blocks(text: str) -> str:
+    return re.sub(
+        r"<think\b[^>]*>.*?</think\s*>",
+        "",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    ).strip()
+
+
 def atomic_write_bytes(path: Path, content: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     partial = path.with_name(f".{path.name}.{uuid.uuid4().hex}.part")
@@ -133,7 +143,51 @@ def atomic_write_bytes(path: Path, content: bytes) -> None:
 
 
 @dataclass(frozen=True)
+class ScriptProviderConfig:
+    base_url: str = DEFAULT_SCRIPT_BASE_URL
+    model: str = DEFAULT_SCRIPT_MODEL
+    api_key_env: str | None = None
+
+    @classmethod
+    def from_mapping(cls, values: Mapping[str, Any]) -> "ScriptProviderConfig":
+        expected = set(cls.__dataclass_fields__)
+        unknown = set(values) - expected
+        if unknown:
+            raise ValueError(
+                "Unknown script_provider keys: " + ", ".join(sorted(unknown))
+            )
+        config = cls(
+            base_url=values.get("base_url", DEFAULT_SCRIPT_BASE_URL),
+            model=values.get("model", DEFAULT_SCRIPT_MODEL),
+            api_key_env=values.get("api_key_env"),
+        )
+        config.validate()
+        return config
+
+    def validate(self) -> None:
+        for name in ("base_url", "model"):
+            if not isinstance(getattr(self, name), str) or not getattr(self, name):
+                raise ValueError(f"script_provider.{name} must be a non-empty string")
+        if not self.base_url.startswith(("http://", "https://")):
+            raise ValueError("script_provider.base_url must use http:// or https://")
+        if self.api_key_env is not None and (
+            not isinstance(self.api_key_env, str) or not self.api_key_env
+        ):
+            raise ValueError(
+                "script_provider.api_key_env must be null or a non-empty string"
+            )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "base_url": self.base_url,
+            "model": self.model,
+            "api_key_env": self.api_key_env,
+        }
+
+
+@dataclass(frozen=True)
 class PipelineConfig:
+    script_provider: ScriptProviderConfig = field(default_factory=ScriptProviderConfig)
     style_block: str = DEFAULT_STYLE_BLOCK
     frame_model: str = "flux2_klein"
     video_mode: str = "i2v"
@@ -152,7 +206,11 @@ class PipelineConfig:
         if unknown:
             raise ValueError(f"Unknown preset keys: {', '.join(sorted(unknown))}")
         merged = {**cls().to_dict(), **dict(values)}
+        raw_script_provider = merged["script_provider"]
+        if not isinstance(raw_script_provider, Mapping):
+            raise ValueError("script_provider must be a YAML mapping")
         config = cls(
+            script_provider=ScriptProviderConfig.from_mapping(raw_script_provider),
             style_block=merged["style_block"],
             frame_model=merged["frame_model"],
             video_mode=merged["video_mode"],
@@ -178,6 +236,7 @@ class PipelineConfig:
         return cls.from_mapping(raw)
 
     def validate(self) -> None:
+        self.script_provider.validate()
         for name in ("style_block", "frame_model", "video_resolution"):
             if not isinstance(getattr(self, name), str) or not getattr(self, name):
                 raise ValueError(f"{name} must be a non-empty string")
@@ -194,6 +253,7 @@ class PipelineConfig:
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "script_provider": self.script_provider.to_dict(),
             "style_block": self.style_block,
             "frame_model": self.frame_model,
             "video_mode": self.video_mode,
@@ -240,7 +300,6 @@ class Settings:
     queue_url: str
     xai_api_key: str
     openai_api_key: str
-    xai_text_model: str
     openai_image_model: str
     openai_image_quality: str
     video_model: str
@@ -279,7 +338,6 @@ class Settings:
             ),
             xai_api_key=os.getenv("XAI_API_KEY", ""),
             openai_api_key=os.getenv("OPENAI_API_KEY", ""),
-            xai_text_model=os.getenv("XAI_TEXT_MODEL", "grok-4.5"),
             openai_image_model=os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-1"),
             openai_image_quality=os.getenv("OPENAI_IMAGE_QUALITY", "low"),
             video_model=os.getenv("XAI_VIDEO_MODEL", "grok-imagine-video"),
@@ -300,6 +358,22 @@ class Settings:
             ),
             voice_preset=os.getenv("TTS_VOICE_PRESET", "alireza").strip(),
         )
+
+
+def script_provider_api_key(
+    settings: Settings,
+    provider: ScriptProviderConfig,
+) -> str:
+    if not provider.api_key_env:
+        return ""
+    configured_keys = {
+        "XAI_API_KEY": settings.xai_api_key,
+        "OPENAI_API_KEY": settings.openai_api_key,
+    }
+    return (
+        os.getenv(provider.api_key_env, "")
+        or configured_keys.get(provider.api_key_env, "")
+    ).strip()
 
 
 RUN_COLUMNS = {
@@ -752,16 +826,15 @@ class NewsPipeline:
         except ValueError as exc:
             raise RemoteAPIError(f"{provider} returned invalid JSON") from exc
 
-    def _xai_chat(
+    def _script_chat(
         self,
         *,
         system_prompt: str,
         user_prompt: str,
-        live_search: bool,
     ) -> tuple[Any, dict[str, Any]]:
-        api_key = self.require_key("XAI_API_KEY", self.settings.xai_api_key)
+        provider = self.config.script_provider
         payload: dict[str, Any] = {
-            "model": self.settings.xai_text_model,
+            "model": provider.model,
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
@@ -769,78 +842,79 @@ class NewsPipeline:
             "response_format": {"type": "json_object"},
             "temperature": 0.2,
         }
-        if live_search:
-            payload["search_parameters"] = {
-                "mode": "on",
-                "max_search_results": 10,
-                "return_citations": True,
-            }
+        headers = {}
+        if provider.api_key_env:
+            api_key = script_provider_api_key(self.settings, provider)
+            if not api_key:
+                raise RuntimeError(
+                    f"{provider.api_key_env} is required by script_provider. "
+                    f"Add it to {self.settings.project_root / '.env'}."
+                )
+            headers["Authorization"] = f"Bearer {api_key}"
         response = self.http.post(
-            XAI_CHAT_URL,
-            headers={"Authorization": f"Bearer {api_key}"},
+            f"{provider.base_url.rstrip('/')}/chat/completions",
+            headers=headers,
             json=payload,
         )
-        data = self._response_json(response, "xAI Chat Completions")
+        data = self._response_json(response, "Script provider Chat Completions")
         try:
             content = data["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as exc:
             raise RemoteAPIError(
-                "xAI response did not contain message content"
+                "Script provider response did not contain message content"
             ) from exc
-        return parse_json_text(str(content)), data
+        return parse_json_text(strip_think_blocks(str(content))), data
 
     def fetch_story(self) -> None:
         topic = self.current()["topic"]
         system_prompt = (
-            "You are a rigorous breaking-news editor. Use live search, verify "
-            "claims across multiple recent sources, reject rumors, and return "
-            "only one valid JSON object."
+            "You are an expert explainer producer. Develop an original, "
+            "evergreen content brief from the supplied topic itself. Do not "
+            "claim to have performed live research and do not invent sources, "
+            "quotes, statistics, or current events. Return only valid JSON."
         )
         user_prompt = f"""
-Find the strongest current story for a 50-second vertical news Short.
-Editorial topic: {topic}
+Create a focused brief for a 50-second vertical explainer about this exact
+topic:
+
+{topic}
 
 Return exactly this shape:
 {{
-  "title": "concise headline",
-  "summary": "two to four factual sentences",
+  "title": "concise evergreen explainer title",
+  "summary": "two to four sentences defining the topic and central thesis",
   "why_it_matters": "one sentence",
-  "score": 0,
-  "score_breakdown": {{
-    "recency": 0,
-    "impact": 0,
-    "visual_potential": 0,
-    "source_confidence": 0
-  }},
-  "sources": [
-    {{"title": "source title", "url": "https://..."}}
+  "audience": "who this explainer is for",
+  "angle": "the original narrative angle",
+  "key_points": [
+    "specific point to explain",
+    "specific point to explain",
+    "specific point to explain"
   ]
 }}
 
-The overall score and each component must be integers from 0 to 100.
-Only select a story supported by at least two credible sources.
+Treat the topic as the complete editorial brief. Favor durable explanations
+over time-sensitive claims. Build a clear progression that can be expressed
+visually without on-screen text.
 """.strip()
-        story, raw = self._xai_chat(
+        story, _ = self._script_chat(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
-            live_search=True,
         )
         if not isinstance(story, dict):
             raise ValueError("fetch_story must return a JSON object")
-        for key in ("title", "summary", "why_it_matters", "score", "sources"):
+        for key in (
+            "title",
+            "summary",
+            "why_it_matters",
+            "audience",
+            "angle",
+            "key_points",
+        ):
             if key not in story:
-                raise ValueError(f"Story JSON is missing {key}")
-        try:
-            score = int(story["score"])
-        except (TypeError, ValueError) as exc:
-            raise ValueError("Story score must be an integer") from exc
-        if not 0 <= score <= 100:
-            raise ValueError("Story score must be between 0 and 100")
-        if not isinstance(story["sources"], list) or len(story["sources"]) < 2:
-            raise ValueError("Story must include at least two sources")
-        citations = raw.get("citations")
-        if citations:
-            story["xai_citations"] = citations
+                raise ValueError(f"Brief JSON is missing {key}")
+        if not isinstance(story["key_points"], list) or len(story["key_points"]) < 3:
+            raise ValueError("Brief must include at least three key points")
         self.store.update_run(
             self.run_id,
             status="fetched",
@@ -869,16 +943,17 @@ Only select a story supported by at least two credible sources.
             ),
         }[self.config.video_mode]
         system_prompt = (
-            "You write accurate, fast-paced vertical news video scripts. "
-            "Return only valid JSON. Do not invent facts beyond the supplied "
-            "verified story. Each shot must have exactly one simple camera "
-            "move as its motion instruction."
+            "You write original, accurate, fast-paced evergreen explainer "
+            "scripts for vertical video. Return only valid JSON. Stay within "
+            "the supplied topic brief and do not invent sources, quotes, "
+            "statistics, or timely claims. Each shot must have exactly one "
+            "simple camera move as its motion instruction."
         )
         user_prompt = f"""
-Turn this verified story into a 50-second YouTube Short split into exactly five
-10-second shots.
+Turn this topic brief into an original 50-second evergreen YouTube explainer
+split into exactly five 10-second shots.
 
-STORY:
+TOPIC BRIEF:
 {json.dumps(story, ensure_ascii=False)}
 
 STYLE BLOCK (copy this exact string at the beginning of every frame prompt):
@@ -886,8 +961,8 @@ STYLE BLOCK (copy this exact string at the beginning of every frame prompt):
 
 Return exactly:
 {{
-  "title": "YouTube Shorts title, factual and compelling",
-  "description": "Two short paragraphs plus source URLs",
+  "title": "YouTube Shorts explainer title, clear and compelling",
+  "description": "Two short paragraphs describing the explainer",
   "shots": [
     {{
       "voiceover_text": "spoken narration for this 10-second shot",
@@ -902,18 +977,19 @@ Return exactly:
 Requirements:
 - Exactly five shots.
 - Total voiceover should sound natural in about 50 seconds.
-- Shot 1 hooks immediately; shot 5 explains why the story matters.
+- Shot 1 hooks immediately; shots 2-4 build the explanation; shot 5 lands the
+  central insight and why it matters.
 - Exactly one short camera move per motion_instruction (for example "slow
   push-in", "gentle pan left", or "static locked-off"); do not combine moves.
 - {mode_instruction}
 - Begin every non-null frame prompt with the STYLE BLOCK exactly as supplied.
 - No visible text, logos, watermarks, captions, or UI in image prompts.
-- Preserve uncertainty and attribution from the source story.
+- Make each narration line original and explanatory, with no claim of live
+  reporting or external sourcing.
 """.strip()
-        script, _ = self._xai_chat(
+        script, _ = self._script_chat(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
-            live_search=False,
         )
         if not isinstance(script, dict):
             raise ValueError("write_script must return a JSON object")
@@ -2205,7 +2281,7 @@ Requirements:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Create a crash-resumable 50-second vertical news video."
+        description="Create a crash-resumable 50-second vertical explainer video."
     )
     parser.add_argument(
         "--topic",
@@ -2296,7 +2372,7 @@ def choose_run(
     selected_topic = (
         topic
         or os.getenv("NEWS_TOPIC")
-        or "the most consequential, verifiable breaking news story right now"
+        or "how artificial intelligence turns data and compute into useful tools"
     )
     return store.create_run(selected_topic)
 
@@ -2330,7 +2406,17 @@ def configure_run(
     return updated, config, visuals, frame_gate
 
 
-def validate_startup(settings: Settings, visuals: str) -> None:
+def validate_startup(
+    settings: Settings,
+    visuals: str,
+    config: PipelineConfig,
+) -> None:
+    provider = config.script_provider
+    if provider.api_key_env and not script_provider_api_key(settings, provider):
+        raise RuntimeError(
+            f"{provider.api_key_env} is required by the selected script_provider; "
+            "refusing to start before any API spend or queue activity."
+        )
     if visuals == "cloud" and not settings.xai_api_key:
         raise RuntimeError(
             "XAI_API_KEY is required for --visuals cloud; refusing to start "
@@ -2519,11 +2605,12 @@ def main(argv: list[str] | None = None) -> int:
         database_path=args.db,
         work_root=args.work_root,
     )
-    try:
-        validate_startup(settings, args.visuals)
-    except RuntimeError as exc:
-        LOG.error("%s", exc)
-        return 2
+    if args.new:
+        try:
+            validate_startup(settings, args.visuals, preset)
+        except RuntimeError as exc:
+            LOG.error("%s", exc)
+            return 2
     store = StateStore(settings.database_path)
     try:
         run = choose_run(
@@ -2543,7 +2630,7 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as exc:
         parser.error(str(exc))
     try:
-        validate_startup(settings, visuals)
+        validate_startup(settings, visuals, preset)
     except RuntimeError as exc:
         LOG.error("%s", exc)
         return 2
