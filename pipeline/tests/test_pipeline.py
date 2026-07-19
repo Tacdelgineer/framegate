@@ -387,6 +387,130 @@ def test_default_preset_loads_and_cli_defaults_local() -> None:
     assert args.frame_gate is True
 
 
+def test_status_interfaces_report_sqlite_state_read_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    database_path = tmp_path / "pipeline.sqlite3"
+    store = module.StateStore(database_path)
+    run = store.create_run("status topic")
+    gate = {
+        "frames": [
+            {
+                "index": 1,
+                "shot_index": 1,
+                "role": "first",
+                "generation": 2,
+                "status": "approved",
+            },
+            {
+                "index": 2,
+                "shot_index": 2,
+                "role": "first",
+                "generation": 0,
+                "status": "pending",
+            },
+        ]
+    }
+    run = store.update_run(
+        run["id"],
+        status="framed",
+        frame_gate_json=json.dumps(gate),
+        run_config_json=json.dumps({"frame_gate": True}),
+        last_error="most recent error",
+    )
+    completed = store.start_attempt(run["id"], "generate_first_frames")
+    store.finish_attempt(completed, "succeeded")
+    failed = store.start_attempt(run["id"], "frame_gate")
+    store.finish_attempt(failed, "failed", "approval timeout")
+    store.start_attempt(run["id"], "frame_gate")
+    monkeypatch.setattr(module, "load_environment", lambda _: None)
+
+    result = module.main(
+        [
+            "--run-id",
+            run["id"],
+            "--status",
+            "--json",
+            "--db",
+            str(database_path),
+            "--config",
+            str(tmp_path / "missing-preset.yaml"),
+        ]
+    )
+
+    assert result == 0
+    summary = json.loads(capsys.readouterr().out)
+    assert summary["run_id"] == run["id"]
+    assert summary["topic"] == "status topic"
+    assert summary["state"] == "framed"
+    assert summary["current_stage"] == "frame_gate"
+    assert summary["frame_gate"]["enabled"] is True
+    assert summary["frame_gate"]["shots"][0] == {
+        "shot": 1,
+        "state": "approved",
+        "frames": [
+            {
+                "role": "first",
+                "state": "approved",
+                "generation": 2,
+            }
+        ],
+    }
+    assert summary["frame_gate"]["shots"][2]["state"] == "not_started"
+    assert [job["stage"] for job in summary["jobs"]["completed"]] == [
+        "generate_first_frames"
+    ]
+    assert summary["jobs"]["failed"][0]["error"] == "approval timeout"
+    assert summary["jobs"]["running"][0]["stage"] == "frame_gate"
+    assert summary["timestamps"]["created_at"]
+    assert summary["timestamps"]["updated_at"]
+
+    result = module.main(["--status", "--db", str(database_path)])
+
+    assert result == 0
+    output = capsys.readouterr().out
+    assert f"Run ID: {run['id']}" in output
+    assert "Current stage: frame_gate" in output
+    assert "Shot 1: approved [first=approved (generation 2)]" in output
+    assert "Completed jobs (1):" in output
+    assert "Failed jobs (1):" in output
+
+
+def test_json_implies_status_and_prefers_unfinished_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    database_path = tmp_path / "pipeline.sqlite3"
+    store = module.StateStore(database_path)
+    unfinished = store.create_run("unfinished")
+    finished = store.create_run("finished")
+    store.update_run(finished["id"], status="published")
+    monkeypatch.setattr(module, "load_environment", lambda _: None)
+
+    result = module.main(["--json", "--db", str(database_path)])
+
+    assert result == 0
+    summary = json.loads(capsys.readouterr().out)
+    assert summary["run_id"] == unfinished["id"]
+
+
+def test_status_does_not_create_a_missing_database(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "missing" / "pipeline.sqlite3"
+    monkeypatch.setattr(module, "load_environment", lambda _: None)
+
+    result = module.main(["--status", "--db", str(database_path)])
+
+    assert result == 1
+    assert not database_path.exists()
+    assert not database_path.parent.exists()
+
+
 def test_local_visuals_enqueue_frame_and_video_jobs(tmp_path: Path) -> None:
     config = settings(tmp_path)
     store = module.StateStore(config.database_path)

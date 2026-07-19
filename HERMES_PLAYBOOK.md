@@ -38,6 +38,8 @@ printf 'pid=%s log=%s\n' "$!" "$RUN_LOG"
 ### Check run status
 
 Use only the pipeline status interface and request machine-readable output.
+`--run-id` selects a specific run; without it, `--status` selects the current
+unfinished run or, if none exists, the most-recent terminal run.
 
 ```bash
 /home/alireza/content-factory/pipeline/.venv/bin/python \
@@ -45,8 +47,17 @@ Use only the pipeline status interface and request machine-readable output.
   --run-id "$RUN_ID" --status --json
 ```
 
-If `--status` or `--json` is rejected, stop and escalate the missing interface.
-The current CLI lacks these flags; never query or modify SQLite as a workaround.
+For a human-readable summary of the current/most-recent run:
+
+```bash
+/home/alireza/content-factory/pipeline/.venv/bin/python \
+  /home/alireza/content-factory/pipeline/news_pipeline.py --status
+```
+
+`--json` implies `--status`, but spell out both flags in operational commands.
+Both forms are read-only and report the run ID, topic, current stage, per-shot
+frame gate, completed/failed jobs, and timestamps. Never query or modify SQLite
+directly as a workaround.
 
 ### Tail pipeline logs
 

@@ -326,13 +326,27 @@ RUN_COLUMNS = {
 
 
 class StateStore:
-    def __init__(self, database_path: Path):
+    def __init__(self, database_path: Path, *, read_only: bool = False):
         self.database_path = database_path
+        self.read_only = read_only
+        if read_only:
+            return
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         self.initialize()
 
     def connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.database_path, timeout=10)
+        if self.read_only:
+            database_uri = (
+                f"{self.database_path.expanduser().resolve().as_uri()}?mode=ro"
+            )
+            connection = sqlite3.connect(
+                database_uri,
+                timeout=10,
+                uri=True,
+            )
+            connection.execute("PRAGMA query_only = ON")
+        else:
+            connection = sqlite3.connect(self.database_path, timeout=10)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA busy_timeout = 10000")
@@ -474,6 +488,38 @@ class StateStore:
                 """
             ).fetchone()
         return dict(row) if row is not None else None
+
+    def current_or_latest(self) -> dict[str, Any] | None:
+        """Return the newest unfinished run, or the newest terminal run."""
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM runs
+                ORDER BY
+                    CASE
+                        WHEN status IS NULL
+                            OR status NOT IN ('published', 'rejected')
+                        THEN 0
+                        ELSE 1
+                    END,
+                    updated_at DESC
+                LIMIT 1
+                """
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def attempts_for_run(self, run_id: str) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT stage, attempt, started_at, finished_at, outcome, error
+                FROM stage_attempts
+                WHERE run_id = ?
+                ORDER BY id
+                """,
+                (run_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def update_run(self, run_id: str, **values: Any) -> dict[str, Any]:
         unknown = set(values) - RUN_COLUMNS
@@ -2171,6 +2217,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Resume a specific run ID.",
     )
     parser.add_argument(
+        "--status",
+        action="store_true",
+        help="Show read-only status for a specific or current/most-recent run.",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Show status as JSON (implies --status).",
+    )
+    parser.add_argument(
         "--new",
         action="store_true",
         help="Start a new run instead of resuming the latest unfinished run.",
@@ -2282,6 +2338,153 @@ def validate_startup(settings: Settings, visuals: str) -> None:
         )
 
 
+def _frame_gate_summary(run: Mapping[str, Any]) -> dict[str, Any]:
+    run_config = json_load(run.get("run_config_json"), {})
+    enabled = (
+        run_config.get("frame_gate")
+        if isinstance(run_config, Mapping)
+        and isinstance(run_config.get("frame_gate"), bool)
+        else None
+    )
+    gate = json_load(run.get("frame_gate_json"), {})
+    raw_frames = gate.get("frames", []) if isinstance(gate, Mapping) else []
+    grouped: dict[int, list[dict[str, Any]]] = {
+        shot_index: [] for shot_index in range(1, SHOT_COUNT + 1)
+    }
+    if isinstance(raw_frames, list):
+        ordered_frames = sorted(
+            (frame for frame in raw_frames if isinstance(frame, Mapping)),
+            key=lambda frame: (
+                frame.get("index")
+                if isinstance(frame.get("index"), int)
+                else sys.maxsize
+            ),
+        )
+        for frame in ordered_frames:
+            try:
+                shot_index = int(frame.get("shot_index"))
+            except (TypeError, ValueError):
+                continue
+            if shot_index not in grouped:
+                continue
+            grouped[shot_index].append(
+                {
+                    "role": str(frame.get("role") or "frame"),
+                    "state": str(frame.get("status") or "unknown"),
+                    "generation": frame.get("generation"),
+                }
+            )
+
+    shots = []
+    for shot_index, frames in grouped.items():
+        states = {frame["state"] for frame in frames}
+        shot_state = states.pop() if len(states) == 1 else "mixed"
+        if not frames:
+            shot_state = "not_started"
+        shots.append(
+            {
+                "shot": shot_index,
+                "state": shot_state,
+                "frames": frames,
+            }
+        )
+    return {"enabled": enabled, "shots": shots}
+
+
+def build_status_summary(
+    store: StateStore,
+    *,
+    run_id: str | None = None,
+) -> dict[str, Any]:
+    run = store.get_run(run_id) if run_id else store.current_or_latest()
+    if run is None:
+        raise ValueError("No pipeline runs found")
+    attempts = store.attempts_for_run(str(run["id"]))
+    running = (
+        [attempts[-1]] if attempts and attempts[-1]["outcome"] == "running" else []
+    )
+    current_stage = (
+        str(running[-1]["stage"]) if running else str(run["status"] or "not_started")
+    )
+    return {
+        "run_id": str(run["id"]),
+        "topic": str(run["topic"]),
+        "state": str(run["status"] or "not_started"),
+        "current_stage": current_stage,
+        "frame_gate": _frame_gate_summary(run),
+        "jobs": {
+            "completed": [
+                attempt for attempt in attempts if attempt["outcome"] == "succeeded"
+            ],
+            "failed": [
+                attempt for attempt in attempts if attempt["outcome"] == "failed"
+            ],
+            "running": running,
+        },
+        "timestamps": {
+            "created_at": run["created_at"],
+            "updated_at": run["updated_at"],
+            "published_at": run["published_at"],
+        },
+        "last_error": run["last_error"],
+    }
+
+
+def format_status_summary(summary: Mapping[str, Any]) -> str:
+    timestamps = summary["timestamps"]
+    frame_gate = summary["frame_gate"]
+    enabled = frame_gate["enabled"]
+    enabled_label = "unknown" if enabled is None else ("enabled" if enabled else "off")
+    lines = [
+        f"Run ID: {summary['run_id']}",
+        f"Topic: {summary['topic']}",
+        f"State: {summary['state']}",
+        f"Current stage: {summary['current_stage']}",
+        "Timestamps:",
+        f"  Created: {timestamps['created_at']}",
+        f"  Updated: {timestamps['updated_at']}",
+        f"  Published: {timestamps['published_at'] or '-'}",
+        f"Frame gate: {enabled_label}",
+    ]
+    for shot in frame_gate["shots"]:
+        frame_details = ", ".join(
+            (
+                f"{frame['role']}={frame['state']}"
+                + (
+                    f" (generation {frame['generation']})"
+                    if frame["generation"] is not None
+                    else ""
+                )
+            )
+            for frame in shot["frames"]
+        )
+        suffix = f" [{frame_details}]" if frame_details else ""
+        lines.append(f"  Shot {shot['shot']}: {shot['state']}{suffix}")
+
+    for label, key in (
+        ("Completed jobs", "completed"),
+        ("Failed jobs", "failed"),
+        ("Running jobs", "running"),
+    ):
+        jobs = summary["jobs"][key]
+        lines.append(f"{label} ({len(jobs)}):")
+        if not jobs:
+            lines.append("  none")
+            continue
+        for job in jobs:
+            finished = job["finished_at"] or "running"
+            detail = (
+                f"  {job['stage']} attempt {job['attempt']}: "
+                f"{job['started_at']} -> {finished}"
+            )
+            if job["error"]:
+                detail += f" ({job['error']})"
+            lines.append(detail)
+    if summary["last_error"]:
+        lines.append(f"Last error: {summary['last_error']}")
+    return "\n".join(lines)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -2291,6 +2494,22 @@ def main(argv: list[str] | None = None) -> int:
     )
     project_root = Path(__file__).resolve().parent
     load_environment(project_root)
+    if args.status or args.json:
+        database_path = args.db or Path(
+            os.getenv("NEWS_PIPELINE_DB", project_root / "data" / "pipeline.sqlite3")
+        )
+        store = StateStore(database_path, read_only=True)
+        try:
+            summary = build_status_summary(store, run_id=args.run_id)
+        except (sqlite3.Error, ValueError) as exc:
+            LOG.error("Could not read pipeline status: %s", exc)
+            return 1
+        print(
+            json.dumps(summary, indent=2)
+            if args.json
+            else format_status_summary(summary)
+        )
+        return 0
     try:
         preset = PipelineConfig.load(args.config.expanduser().resolve())
     except ValueError as exc:
