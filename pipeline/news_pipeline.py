@@ -81,6 +81,7 @@ DEFAULT_STYLE_BLOCK = "Cinematic news documentary photography, realistic lightin
 DEFAULT_NARRATION_STYLE = "Conversational, curious, direct, and warm."
 DEFAULT_SCRIPT_BASE_URL = "http://100.103.129.82:11434/v1"
 DEFAULT_SCRIPT_MODEL = "qwen3.6:35b-a3b"
+DEFAULT_SCRIPT_TIMEOUT_SECONDS = 900.0
 
 VOICE_PRESETS = {
     "alireza": {
@@ -376,6 +377,7 @@ class ScriptProviderConfig:
     base_url: str = DEFAULT_SCRIPT_BASE_URL
     model: str = DEFAULT_SCRIPT_MODEL
     api_key_env: str | None = None
+    timeout_seconds: float = DEFAULT_SCRIPT_TIMEOUT_SECONDS
 
     @classmethod
     def from_mapping(cls, values: Mapping[str, Any]) -> "ScriptProviderConfig":
@@ -389,6 +391,9 @@ class ScriptProviderConfig:
             base_url=values.get("base_url", DEFAULT_SCRIPT_BASE_URL),
             model=values.get("model", DEFAULT_SCRIPT_MODEL),
             api_key_env=values.get("api_key_env"),
+            timeout_seconds=values.get(
+                "timeout_seconds", DEFAULT_SCRIPT_TIMEOUT_SECONDS
+            ),
         )
         config.validate()
         return config
@@ -405,12 +410,19 @@ class ScriptProviderConfig:
             raise ValueError(
                 "script_provider.api_key_env must be null or a non-empty string"
             )
+        if (
+            isinstance(self.timeout_seconds, bool)
+            or not isinstance(self.timeout_seconds, (int, float))
+            or self.timeout_seconds <= 0
+        ):
+            raise ValueError("script_provider.timeout_seconds must be positive")
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "base_url": self.base_url,
             "model": self.model,
             "api_key_env": self.api_key_env,
+            "timeout_seconds": self.timeout_seconds,
         }
 
 
@@ -1401,6 +1413,8 @@ class NewsPipeline:
             ],
             "response_format": {"type": "json_object"},
             "temperature": 0.2,
+            "stream": True,
+            "stream_options": {"include_usage": True},
         }
         headers = {}
         if provider.api_key_env:
@@ -1411,19 +1425,115 @@ class NewsPipeline:
                     f"Add it to {self.settings.project_root / '.env'}."
                 )
             headers["Authorization"] = f"Bearer {api_key}"
-        response = self.http.post(
-            f"{provider.base_url.rstrip('/')}/chat/completions",
-            headers=headers,
-            json=payload,
+        url = f"{provider.base_url.rstrip('/')}/chat/completions"
+        request_timeout = httpx.Timeout(
+            connect=min(15.0, float(provider.timeout_seconds)),
+            read=self.settings.request_timeout,
+            write=self.settings.request_timeout,
+            pool=self.settings.request_timeout,
         )
-        data = self._response_json(response, "Script provider Chat Completions")
+        started = time.monotonic()
+        status = "failed"
+        usage: dict[str, Any] = {}
+        content_parts: list[str] = []
+        response_metadata: dict[str, Any] = {}
         try:
-            content = data["choices"][0]["message"]["content"]
-        except (KeyError, IndexError, TypeError) as exc:
-            raise RemoteAPIError(
-                "Script provider response did not contain message content"
-            ) from exc
-        return parse_json_text(strip_think_blocks(str(content))), data
+            with self.http.stream(
+                "POST",
+                url,
+                headers=headers,
+                json=payload,
+                timeout=request_timeout,
+            ) as response:
+                if response.is_error:
+                    response.read()
+                    self._response_json(
+                        response,
+                        "Script provider Chat Completions",
+                    )
+                for line in response.iter_lines():
+                    elapsed = time.monotonic() - started
+                    if elapsed >= provider.timeout_seconds:
+                        raise httpx.ReadTimeout(
+                            "Script provider exceeded its overall generation "
+                            f"ceiling of {provider.timeout_seconds:g} seconds",
+                            request=response.request,
+                        )
+                    stripped = line.strip()
+                    if not stripped or stripped.startswith(":"):
+                        continue
+                    if stripped.startswith(("event:", "id:", "retry:")):
+                        continue
+                    if stripped.startswith("data:"):
+                        stripped = stripped[5:].strip()
+                    if stripped == "[DONE]":
+                        break
+                    try:
+                        event = json.loads(stripped)
+                    except json.JSONDecodeError as exc:
+                        raise RemoteAPIError(
+                            "Script provider returned an invalid streaming event"
+                        ) from exc
+                    if not isinstance(event, Mapping):
+                        raise RemoteAPIError(
+                            "Script provider returned a non-object streaming event"
+                        )
+                    error = event.get("error")
+                    if error:
+                        raise RemoteAPIError(f"Script provider stream failed: {error}")
+                    event_usage = event.get("usage")
+                    if isinstance(event_usage, Mapping):
+                        usage.update(event_usage)
+                    for key in ("id", "model", "created", "system_fingerprint"):
+                        if event.get(key) is not None:
+                            response_metadata[key] = event[key]
+                    choices = event.get("choices")
+                    if not isinstance(choices, list) or not choices:
+                        continue
+                    choice = choices[0]
+                    if not isinstance(choice, Mapping):
+                        continue
+                    message = choice.get("delta")
+                    if not isinstance(message, Mapping):
+                        message = choice.get("message")
+                    if not isinstance(message, Mapping):
+                        continue
+                    content = message.get("content")
+                    if content is not None:
+                        content_parts.append(str(content))
+
+            if time.monotonic() - started >= provider.timeout_seconds:
+                raise httpx.ReadTimeout(
+                    "Script provider exceeded its overall generation "
+                    f"ceiling of {provider.timeout_seconds:g} seconds"
+                )
+            content = "".join(content_parts)
+            if not content:
+                raise RemoteAPIError(
+                    "Script provider response did not contain message content"
+                )
+            data = {
+                **response_metadata,
+                "choices": [{"message": {"content": content}}],
+                "usage": usage,
+            }
+            parsed = parse_json_text(strip_think_blocks(content))
+            status = "succeeded"
+            return parsed, data
+        finally:
+            duration = time.monotonic() - started
+            log_level = logging.INFO if status == "succeeded" else logging.WARNING
+            LOG.log(
+                log_level,
+                "Script provider generation %s model=%s duration_seconds=%.2f "
+                "prompt_tokens=%s completion_tokens=%s total_tokens=%s",
+                status,
+                provider.model,
+                duration,
+                usage.get("prompt_tokens", "unknown"),
+                usage.get("completion_tokens", "unknown"),
+                usage.get("total_tokens", "unknown"),
+            )
 
     def fetch_story(self) -> None:
         topic = self.current()["topic"]

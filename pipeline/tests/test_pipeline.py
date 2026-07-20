@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import importlib.util
 import json
+import logging
 import re
 import sys
 import wave
@@ -40,6 +41,26 @@ def write_wav(path: Path, duration_seconds: float, sample_rate: int = 1000) -> N
 class FakeQueue:
     def close(self) -> None:
         pass
+
+
+class StreamingBody(httpx.SyncByteStream):
+    def __init__(self, chunks: list[bytes]):
+        self.chunks = chunks
+
+    def __iter__(self):
+        yield from self.chunks
+
+
+class ReadTimeoutBody(httpx.SyncByteStream):
+    def __iter__(self):
+        yield from ()
+        raise httpx.ReadTimeout("stream became inactive")
+
+
+def sse_event(value) -> bytes:
+    if value == "[DONE]":
+        return b"data: [DONE]\n\n"
+    return f"data: {json.dumps(value)}\n\n".encode()
 
 
 class RecordingQueue(FakeQueue):
@@ -677,6 +698,174 @@ def test_script_provider_selection_uses_configured_endpoint_and_key(
     assert captured["payload"]["model"] == model
 
 
+def test_script_chat_streams_chunks_strips_thinking_and_logs_usage(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    captured = {}
+    chunks = [
+        sse_event(
+            {
+                "id": "chat-1",
+                "model": "qwen-test",
+                "choices": [{"delta": {"content": "<think>slow private "}}],
+            }
+        ),
+        sse_event({"choices": [{"delta": {"content": 'reasoning</think>\n{"ok":'}}]}),
+        sse_event({"choices": [{"delta": {"content": " true}"}}]}),
+        sse_event(
+            {
+                "choices": [],
+                "usage": {
+                    "prompt_tokens": 41,
+                    "completion_tokens": 19,
+                    "total_tokens": 60,
+                },
+            }
+        ),
+        sse_event("[DONE]"),
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["payload"] = json.loads(request.content)
+        captured["timeout"] = request.extensions["timeout"]
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=StreamingBody(chunks),
+        )
+
+    config = settings(tmp_path)
+    store = module.StateStore(config.database_path)
+    run = store.create_run("test")
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    pipeline = module.NewsPipeline(
+        config,
+        store,
+        run,
+        config=module.PipelineConfig(
+            script_provider=module.ScriptProviderConfig(
+                model="qwen-test",
+                timeout_seconds=900,
+            )
+        ),
+        http_client=client,
+        queue_client=FakeQueue(),
+    )
+    try:
+        with caplog.at_level(logging.INFO, logger="news_pipeline"):
+            result, response = pipeline._script_chat(
+                system_prompt="Return JSON.",
+                user_prompt="Test.",
+            )
+    finally:
+        pipeline.close()
+        client.close()
+
+    assert result == {"ok": True}
+    assert response["id"] == "chat-1"
+    assert response["usage"]["completion_tokens"] == 19
+    assert captured["payload"]["stream"] is True
+    assert captured["payload"]["stream_options"] == {"include_usage": True}
+    assert captured["timeout"]["read"] == config.request_timeout
+    assert captured["timeout"]["connect"] == 15.0
+    assert "duration_seconds=" in caplog.text
+    assert "prompt_tokens=41 completion_tokens=19 total_tokens=60" in caplog.text
+
+
+def test_script_chat_enforces_overall_streaming_ceiling(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=StreamingBody(
+                [sse_event({"choices": [{"delta": {"content": '{"ok":'}}]})]
+            ),
+        )
+
+    ticks = iter((0.0, 900.0, 901.0))
+    monkeypatch.setattr(module.time, "monotonic", lambda: next(ticks))
+    config = settings(tmp_path)
+    store = module.StateStore(config.database_path)
+    run = store.create_run("test")
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    pipeline = module.NewsPipeline(
+        config,
+        store,
+        run,
+        config=module.PipelineConfig(
+            script_provider=module.ScriptProviderConfig(timeout_seconds=900)
+        ),
+        http_client=client,
+        queue_client=FakeQueue(),
+    )
+    try:
+        with pytest.raises(httpx.ReadTimeout, match="overall generation ceiling"):
+            pipeline._script_chat(
+                system_prompt="Return JSON.",
+                user_prompt="Test.",
+            )
+    finally:
+        pipeline.close()
+        client.close()
+
+
+def test_script_read_timeout_remains_transient_across_stage_retries(
+    tmp_path: Path,
+) -> None:
+    calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls < 3:
+            return httpx.Response(200, stream=ReadTimeoutBody())
+        return httpx.Response(
+            200,
+            stream=StreamingBody(
+                [
+                    sse_event({"choices": [{"delta": {"content": '{"ok": true}'}}]}),
+                    sse_event("[DONE]"),
+                ]
+            ),
+        )
+
+    config = settings(tmp_path)
+    store = module.StateStore(config.database_path)
+    run = store.create_run("test")
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    pipeline = module.NewsPipeline(
+        config,
+        store,
+        run,
+        http_client=client,
+        queue_client=FakeQueue(),
+    )
+    try:
+        pipeline.run_stage(
+            "streaming_script_test",
+            lambda: pipeline._script_chat(
+                system_prompt="Return JSON.",
+                user_prompt="Test.",
+            ),
+        )
+    finally:
+        pipeline.close()
+        client.close()
+
+    assert calls == 3
+    attempts = store.attempts_for_run(run["id"])
+    assert [attempt["outcome"] for attempt in attempts] == [
+        "failed",
+        "failed",
+        "succeeded",
+    ]
+    assert all("ReadTimeout" in attempt["error"] for attempt in attempts[:2])
+
+
 def test_first_frames_use_gpt_image_1_portrait_contract(tmp_path: Path) -> None:
     calls = []
 
@@ -971,6 +1160,7 @@ def test_default_preset_loads_and_cli_defaults_local() -> None:
     assert preset.script_provider.base_url == "http://100.103.129.82:11434/v1"
     assert preset.script_provider.model == "qwen3.6:35b-a3b"
     assert preset.script_provider.api_key_env is None
+    assert preset.script_provider.timeout_seconds == 900
     assert preset.target_duration_seconds == 45
     assert preset.clip_padding == 0.4
     assert preset.max_clip_seconds == 6

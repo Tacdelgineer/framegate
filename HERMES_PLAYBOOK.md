@@ -126,7 +126,8 @@ improvise.
 
 Edit presets only when the user asks for a style, model, or setting change.
 Limit changes to `script_provider.base_url`, `script_provider.model`,
-`script_provider.api_key_env`, `target_duration_seconds`, `clip_padding`,
+`script_provider.api_key_env`, `script_provider.timeout_seconds`,
+`target_duration_seconds`, `clip_padding`,
 `max_clip_seconds`, `style_block`, `frame_model`, `video_mode`,
 `video_resolution`, `steps_draft`, `steps_final`, `fps_out`, and
 `negative_prompt`; `caption_style.captions_enabled`,
@@ -184,6 +185,9 @@ original snapshot:
 - `caption_style` controls whether captions are enabled and their font size,
   base/highlight colors, and bottom-safe vertical position.
 - `narration_style` is free-text tone guidance injected into the script prompt.
+- `script_provider.timeout_seconds` (default `900`) is the overall ceiling for
+  a streaming script generation; the API request timeout remains a per-chunk
+  inactivity limit.
 
 The execution order is now `scripted → voiced → framed → rendered`: TTS runs
 and is measured per shot before any video job. Per-shot WAV paths and timing

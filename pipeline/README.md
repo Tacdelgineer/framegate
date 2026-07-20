@@ -58,11 +58,14 @@ at 16fps without exceeding `max_clip_seconds`. Narration over the cap gets one
 script-provider shortening retry; if it is still long, assembly holds the last
 video frame instead of cutting the audio.
 
-`script_provider` contains `base_url`, `model`, and optional `api_key_env`.
+`script_provider` contains `base_url`, `model`, optional `api_key_env`, and an
+overall streaming-generation `timeout_seconds` ceiling (default 900 seconds).
 Use `https://api.x.ai/v1` with `XAI_API_KEY` for xAI, or
 `https://api.openai.com/v1` with `OPENAI_API_KEY` for OpenAI. A selected key
 environment variable must be configured before a run starts. `--visuals` does
-not select or alter the script provider.
+not select or alter the script provider. Script calls stream their response;
+`API_REQUEST_TIMEOUT` is applied to each period of network inactivity, while
+thinking/output chunks keep an otherwise slow generation alive.
 
 ## State machine
 

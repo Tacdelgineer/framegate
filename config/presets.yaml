@@ -8,12 +8,14 @@ script_provider:
   base_url: http://100.103.129.82:11434/v1
   model: qwen3.6:35b-a3b
   api_key_env: null
+  # Overall ceiling; API_REQUEST_TIMEOUT remains the per-chunk inactivity limit.
+  timeout_seconds: 900
 # Narration drives timing: the script fills the target, then each clip uses its
 # measured shot narration plus padding, bounded by the per-clip cap.
 target_duration_seconds: 45
 clip_padding: 0.4
 max_clip_seconds: 6.0
-style_block: "isometric voxel diorama, chunky cubic blocks, tilt-shift macro photography, soft studio lighting, vibrant color palette against dark clean background, highly detailed 3D render, shallow depth of field"
+style_block: "isometric voxel diorama, chunky cubic blocks, cutaway cross-section view, tilt-shift macro photography, soft studio lighting, vibrant color palette against dark clean background, highly detailed 3D render"
 frame_model: flux2_klein
 video_mode: auto
 video_resolution: 720x1280
