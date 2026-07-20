@@ -57,8 +57,10 @@ PNG.
   "payload": {
     "frame": "http://VPS:8787/files/start.png",
     "prompt": "The camera slowly pushes forward",
-    "seconds": 5,
-    "aspect": "9:16"
+    "duration_seconds": 3,
+    "frame_count": 49,
+    "fps": 16,
+    "aspect_ratio": "9:16"
   }
 }
 ```
@@ -75,7 +77,9 @@ One input frame selects the plain Wan 2.2 I2V graph. Two frames select
       "http://VPS:8787/files/end.png"
     ],
     "prompt": "A smooth continuous transformation",
-    "seconds": 5
+    "duration_seconds": 5,
+    "frame_count": 81,
+    "fps": 16
   }
 }
 ```
@@ -83,12 +87,23 @@ One input frame selects the plain Wan 2.2 I2V graph. Two frames select
 Accepted frame forms are `frame` (a URL or one/two-element list), `frames`,
 `start_frame` plus optional `end_frame`, and the corresponding `_url` aliases.
 Exactly one or two inputs are required. Video output is a 576x1024 H.264 MP4 at
-16 fps; lengths are rounded to Wan's required `4n+1` frame count.
+16 fps. `frame_count` is authoritative when supplied and must be a positive
+`4n+1` value no greater than 129, Wan's eight-second cap. The worker patches
+that exact length into either Wan graph and does not trim the generated clip.
+`duration_seconds` records the narration target and may be longer than the Wan
+generation cap when `frame_count` is explicitly capped at 129; assembly holds
+the last generated frame for the remaining narration. Legacy `seconds`
+remains an alias when `frame_count` is omitted.
 
-Queue-native multipart inputs are also supported. Use roles `start_frame` and
-optional `end_frame` for video, `audio` for transcription, and `clip_1` plus
-`voiceover` for assembly. The worker injects each queue-provided
-`download_url` into the handler payload after claiming.
+Queue-native multipart inputs are also supported. Use role `frame` (or
+`start_frame` and optional `end_frame`) for video and `audio` for
+transcription. Assembly must provide ordered `clip_roles` (for example,
+`["clip_1", "clip_2"]`) plus `voiceover_role` and optional `captions_role`;
+the worker resolves uploads in the declared order. During final muxing the
+worker clone-pads the last video frame with `tpad` before applying
+`-shortest`, so the complete narration is retained rather than trimmed to a
+short visual stream. The worker injects each queue-provided `download_url`
+into the handler payload after claiming.
 
 TTS also accepts `ref_audio_url`, `ref_audio_path` (restricted to
 `/srv/ai/assets`), and `ref_text`. Text-only jobs use the configured Narrator
@@ -132,12 +147,12 @@ uv run --frozen python test_jobs.py \
   --wait
 ```
 
-Add one real frame and one real five-second video:
+Add one real frame and one real video:
 
 ```bash
 uv run --frozen python test_jobs.py \
   --jobs-url http://VPS_TAILSCALE_IP:8787/jobs \
-  --visual-only --video-input-frames 2 --wait
+  --visual-only --video-input-frames 2 --video-frame-count 49 --wait
 ```
 
 Use `--video-input-frames 1` to exercise plain I2V, or `2` to exercise the

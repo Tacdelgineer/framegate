@@ -236,6 +236,128 @@ class VisualJobTests(unittest.TestCase):
             ["https://queue.test/start", "https://queue.test/end"],
         )
 
+    def test_queue_input_files_follow_declared_assemble_clip_roles(self) -> None:
+        payload: dict[str, object] = {
+            "clip_roles": ["clip_2", "clip_1"],
+            "voiceover_role": "narration",
+            "captions_role": "subtitles",
+        }
+        self.processor._inject_queue_inputs(
+            "assemble",
+            payload,
+            [
+                {"role": "clip_1", "download_url": "https://queue.test/one"},
+                {"role": "subtitles", "download_url": "https://queue.test/srt"},
+                {"role": "clip_2", "download_url": "https://queue.test/two"},
+                {
+                    "role": "narration",
+                    "download_url": "https://queue.test/voice",
+                },
+            ],
+        )
+        self.assertEqual(
+            payload["clips"],
+            ["https://queue.test/two", "https://queue.test/one"],
+        )
+        self.assertEqual(payload["voiceover_url"], "https://queue.test/voice")
+        self.assertEqual(payload["captions_url"], "https://queue.test/srt")
+
+    def test_video_timing_accepts_narration_frame_count(self) -> None:
+        self.assertEqual(
+            self.processor._video_timing(
+                {
+                    "duration_seconds": 3.0,
+                    "frame_count": 49,
+                    "fps": 16,
+                }
+            ),
+            (49, 3.0),
+        )
+        self.assertEqual(
+            self.processor._video_timing(
+                {
+                    "duration_seconds": 10.0,
+                    "frame_count": 129,
+                    "fps": 16,
+                }
+            ),
+            (129, 10.0),
+        )
+
+    def test_video_timing_rejects_invalid_frame_counts(self) -> None:
+        for frame_count, message in (
+            (48, "4n\\+1"),
+            (0, "4n\\+1"),
+            (133, "8s cap"),
+            (49.0, "integer"),
+            (True, "integer"),
+        ):
+            with self.subTest(frame_count=frame_count):
+                with self.assertRaisesRegex(
+                    pipeline_worker.PipelineError,
+                    message,
+                ):
+                    self.processor._video_timing(
+                        {
+                            "duration_seconds": 3.0,
+                            "frame_count": frame_count,
+                            "fps": 16,
+                        }
+                    )
+
+    def test_video_timing_requires_16_fps(self) -> None:
+        with self.assertRaisesRegex(
+            pipeline_worker.PipelineError,
+            "fps must be 16",
+        ):
+            self.processor._video_timing(
+                {
+                    "duration_seconds": 3.0,
+                    "frame_count": 49,
+                    "fps": 24,
+                }
+            )
+
+    def test_assemble_clone_pads_video_so_narration_is_not_trimmed(self) -> None:
+        root = Path(self.temporary.name)
+        clip = root / "clip.mp4"
+        voiceover = root / "voiceover.wav"
+        with (
+            mock.patch.object(
+                self.processor,
+                "download",
+                side_effect=[clip, voiceover],
+            ),
+            mock.patch.object(
+                pipeline_worker,
+                "run_command",
+            ) as run_command,
+            mock.patch.object(
+                self.processor,
+                "_load_captions",
+                return_value=[],
+            ),
+            mock.patch.object(
+                self.processor,
+                "_duration",
+                return_value=10.0,
+            ),
+        ):
+            self.processor.assemble(
+                {
+                    "clips": ["https://queue.test/clip"],
+                    "voiceover_url": "https://queue.test/voiceover",
+                },
+                root,
+            )
+        mux_command = run_command.call_args_list[-1].args[0]
+        filter_index = mux_command.index("-vf")
+        self.assertEqual(
+            mux_command[filter_index + 1],
+            "tpad=stop_mode=clone",
+        )
+        self.assertIn("-shortest", mux_command)
+
     def test_video_accepts_two_frames_and_selects_first_last_workflow(self) -> None:
         cases = (
             {
@@ -283,7 +405,9 @@ class VisualJobTests(unittest.TestCase):
                 "https://example.test/start.png",
                 "https://example.test/end.png",
             ],
-            "seconds": 5,
+            "duration_seconds": 3,
+            "frame_count": 49,
+            "fps": 16,
             "seed": 7,
         }
         with (
@@ -312,11 +436,13 @@ class VisualJobTests(unittest.TestCase):
             )
         graph = run.call_args.args[0]
         self.assertEqual(graph["7"]["class_type"], "WanFirstLastFrameToVideo")
-        self.assertEqual(graph["7"]["inputs"]["length"], 81)
+        self.assertEqual(graph["7"]["inputs"]["length"], 49)
         self.assertEqual(artifact, output)
         self.assertEqual(result["workflow_variant"], "first_last")
         self.assertEqual(result["input_frame_count"], 2)
-        self.assertEqual(result["duration"], 5.0625)
+        self.assertEqual(result["frame_count"], 49)
+        self.assertEqual(result["requested_seconds"], 3.0)
+        self.assertEqual(result["duration"], 3.0625)
 
     def test_video_selects_plain_i2v_workflow_for_one_frame(self) -> None:
         output = self.config.comfyui_output_dir / "video.mp4"

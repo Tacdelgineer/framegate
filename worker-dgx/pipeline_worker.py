@@ -11,6 +11,7 @@ import http.server
 import ipaddress
 import json
 import logging
+import math
 import os
 import shutil
 import signal
@@ -33,6 +34,8 @@ VISUAL_WORKFLOWS = (
     "wan22_first_last_api.json",
 )
 COMFYUI_FREE_SETTLE_SECONDS = 2
+VIDEO_FPS = 16
+VIDEO_MAX_FRAME_COUNT = 129
 
 
 class PipelineError(RuntimeError):
@@ -712,10 +715,40 @@ class JobProcessor:
             if by_role.get("audio"):
                 payload["audio_url"] = by_role["audio"]
         elif job_type == "assemble":
+            clip_roles = payload.get("clip_roles")
+            if clip_roles is not None:
+                if (
+                    not isinstance(clip_roles, list)
+                    or not clip_roles
+                    or any(
+                        not isinstance(role, str) or not role
+                        for role in clip_roles
+                    )
+                ):
+                    raise PipelineError(
+                        "assemble clip_roles must be a non-empty list of role names"
+                    )
+                if len(set(clip_roles)) != len(clip_roles):
+                    raise PipelineError("assemble clip_roles must not contain duplicates")
+                missing_roles = [
+                    role for role in clip_roles if role not in by_role
+                ]
+                if missing_roles:
+                    raise PipelineError(
+                        "assemble input files are missing declared clip roles: "
+                        + ", ".join(missing_roles)
+                    )
+                payload["clips"] = [by_role[role] for role in clip_roles]
             if not (payload.get("voiceover_url") or payload.get("vo_url")):
-                if by_role.get("voiceover"):
-                    payload["voiceover_url"] = by_role["voiceover"]
-            if not (payload.get("clips") or payload.get("clip_urls")):
+                voiceover_role = str(
+                    payload.get("voiceover_role") or "voiceover"
+                )
+                if by_role.get(voiceover_role):
+                    payload["voiceover_url"] = by_role[voiceover_role]
+            if (
+                clip_roles is None
+                and not (payload.get("clips") or payload.get("clip_urls"))
+            ):
                 clips = [
                     url
                     for role, url in sorted(by_role.items())
@@ -723,8 +756,10 @@ class JobProcessor:
                 ]
                 if clips:
                     payload["clips"] = clips
-            if not payload.get("captions_url") and by_role.get("captions"):
-                payload["captions_url"] = by_role["captions"]
+            if not payload.get("captions_url"):
+                captions_role = str(payload.get("captions_role") or "captions")
+                if by_role.get(captions_role):
+                    payload["captions_url"] = by_role[captions_role]
         elif job_type == "tts" and not (
             payload.get("ref_audio_url") or payload.get("ref_audio_path")
         ):
@@ -893,6 +928,68 @@ class JobProcessor:
             for index, value in enumerate(raw_frames, 1)
         ]
 
+    @staticmethod
+    def _video_timing(payload: dict[str, Any]) -> tuple[int, float]:
+        raw_fps = payload.get("fps", VIDEO_FPS)
+        if isinstance(raw_fps, bool):
+            raise PipelineError(f"video fps must be {VIDEO_FPS}")
+        try:
+            fps = float(raw_fps)
+        except (TypeError, ValueError) as exc:
+            raise PipelineError(f"video fps must be {VIDEO_FPS}") from exc
+        if fps != VIDEO_FPS:
+            raise PipelineError(f"video fps must be {VIDEO_FPS}; got {raw_fps!r}")
+
+        raw_frame_count = payload.get("frame_count")
+        if raw_frame_count is not None:
+            if isinstance(raw_frame_count, bool) or not isinstance(
+                raw_frame_count, int
+            ):
+                raise PipelineError(
+                    "video frame_count must be an integer in Wan's 4n+1 form"
+                )
+            frame_count = raw_frame_count
+            if frame_count > VIDEO_MAX_FRAME_COUNT:
+                raise PipelineError(
+                    "video frame_count exceeds the 8s cap of "
+                    f"{VIDEO_MAX_FRAME_COUNT} frames; got {frame_count}"
+                )
+            if frame_count < 1 or (frame_count - 1) % 4:
+                raise PipelineError(
+                    "video frame_count must be a positive 4n+1 value "
+                    f"at {VIDEO_FPS} fps; got {frame_count}"
+                )
+
+        raw_seconds = payload.get("duration_seconds")
+        if raw_seconds is None:
+            raw_seconds = payload.get("seconds")
+        if raw_seconds is None:
+            seconds = 5.0
+        else:
+            if isinstance(raw_seconds, bool):
+                raise PipelineError(
+                    "video duration_seconds must be a positive number"
+                )
+            try:
+                seconds = float(raw_seconds)
+            except (TypeError, ValueError) as exc:
+                raise PipelineError(
+                    "video duration_seconds must be a positive number"
+                ) from exc
+            if not math.isfinite(seconds) or seconds <= 0:
+                raise PipelineError(
+                    "video duration_seconds must be a positive number"
+                )
+
+        if raw_frame_count is None:
+            frame_count = math.ceil(seconds * VIDEO_FPS / 4) * 4 + 1
+            if frame_count > VIDEO_MAX_FRAME_COUNT:
+                raise PipelineError(
+                    "video duration_seconds requires a frame_count above "
+                    f"the 8s cap of {VIDEO_MAX_FRAME_COUNT} frames"
+                )
+        return frame_count, seconds
+
     def _stage_comfy_frame(
         self,
         url: str,
@@ -955,20 +1052,18 @@ class JobProcessor:
         self, payload: dict[str, Any], work_dir: Path
     ) -> tuple[Path, dict[str, Any]]:
         prompt = self._prompt(payload, "video")
-        aspect = str(payload.get("aspect") or "9:16")
+        aspect = str(
+            payload.get("aspect")
+            or payload.get("aspect_ratio")
+            or "9:16"
+        )
         if aspect != "9:16":
             raise PipelineError("video currently supports only aspect='9:16'")
-        try:
-            seconds = float(payload.get("seconds", 5))
-        except (TypeError, ValueError) as exc:
-            raise PipelineError("video seconds must be a number") from exc
-        if not 1 <= seconds <= 10:
-            raise PipelineError("video seconds must be between 1 and 10")
         frame_urls = self._video_frame_urls(payload)
+        frame_count, seconds = self._video_timing(payload)
         available_gb = self._require_visual_headroom()
         seed = self._seed(payload)
-        fps = 16
-        frame_count = round(seconds * fps / 4) * 4 + 1
+        fps = VIDEO_FPS
         nominal_seconds = frame_count / fps
         first_last = len(frame_urls) == 2
         workflow_name = (
@@ -1226,6 +1321,7 @@ class JobProcessor:
             "-i",
             str(voiceover),
         ]
+        video_filters = ["tpad=stop_mode=clone"]
         if captions:
             subtitle_path = self._write_srt(captions, work_dir / "captions.srt")
             escaped = (
@@ -1234,14 +1330,14 @@ class JobProcessor:
                 .replace(":", "\\:")
                 .replace("'", "\\'")
             )
-            command += [
-                "-vf",
+            video_filters.append(
                 (
                     f"subtitles=filename='{escaped}':"
                     "force_style='Alignment=2,FontSize=18,MarginV=110,"
                     "Outline=2,Shadow=1'"
-                ),
-            ]
+                )
+            )
+        command += ["-vf", ",".join(video_filters)]
         command += [
             "-map",
             "0:v:0",

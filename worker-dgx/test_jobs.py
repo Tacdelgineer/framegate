@@ -242,6 +242,12 @@ def parse_args() -> argparse.Namespace:
         help="Use plain I2V (1) or Wan first/last-frame-to-video (2).",
     )
     parser.add_argument(
+        "--video-frame-count",
+        type=int,
+        default=81,
+        help="Wan frame count in 4n+1 form, up to 129 (default: 81).",
+    )
+    parser.add_argument(
         "--frame-prompt",
         default=(
             "A cinematic vertical photograph of a neon-lit desert observatory "
@@ -331,8 +337,12 @@ def main() -> int:
                     "video",
                     {
                         "prompt": args.video_prompt,
-                        "seconds": 5,
-                        "aspect": "9:16",
+                        "duration_seconds": (
+                            args.video_frame_count - 1
+                        ) / 16,
+                        "frame_count": args.video_frame_count,
+                        "fps": 16,
+                        "aspect_ratio": "9:16",
                     },
                     curl=args.curl,
                     input_files=video_inputs,
