@@ -160,3 +160,123 @@ Suspected cause:
 
 State uncertainty explicitly. Do not claim a cause that the available evidence
 does not support.
+
+## Deployment
+
+### Installed Hermes services and configuration
+
+Hermes Agent is a git installation at
+`/home/alireza/.hermes/hermes-agent` (the `hermes` executable resolves through
+`/home/alireza/.local/bin/hermes`). Its machine-level configuration and default
+persona are `/home/alireza/.hermes/config.yaml` and
+`/home/alireza/.hermes/SOUL.md`.
+
+Two user services are installed:
+
+- `hermes-serve.service` runs `hermes serve` from
+  `/home/alireza/hermes-workspace` on `100.123.208.90:9119`, loading
+  `/home/alireza/.hermes/.env`.
+- `hermes-webui.service` runs `/home/alireza/hermes-webui/server.py` on
+  `100.123.208.90:8788`.
+
+The messaging gateway is a separate Hermes process and is not currently
+installed or running as a service. Telegram is not currently configured in
+`/home/alireza/.hermes/.env`.
+
+Hermes profiles are isolated `HERMES_HOME` directories under
+`/home/alireza/.hermes/profiles/`. Each profile can have its own `config.yaml`,
+`SOUL.md`, sessions, memory, skills, and gateway state. Hermes reads
+`$HERMES_HOME/SOUL.md` once when it builds a new session's system prompt.
+
+### `factory-ops` profile
+
+The pipeline operator is the named profile `factory-ops`:
+
+- Home: `/home/alireza/.hermes/profiles/factory-ops`
+- Model: `grok-build-0.1`
+- Provider: `xai-oauth` (the existing root xAI OAuth grant is available to
+  named profiles through Hermes' global auth fallback)
+- Workspace: `/home/alireza/content-factory`
+- Skills: bundled skills are opted out, keeping this operator narrow
+- Prompt: `SOUL.md` is a symlink to
+  `/home/alireza/content-factory/HERMES_PLAYBOOK.md`
+
+The symlink is intentional: Hermes follows it when a new session starts, so
+the full current playbook is loaded without embedding or regeneration. A
+playbook edit affects new `factory-ops` sessions; it does not rewrite the
+prompt cache of an already-running session. Hermes appends its framework-level
+tool and session guidance after the profile identity prompt.
+
+The reproducible installer and model template are
+`deploy/hermes/install-factory-ops.sh` and
+`deploy/hermes/factory-ops.config.yaml`. Run the installer as `alireza` after
+moving the repository or recreating the profile. It does not select or modify
+the default profile.
+
+The profile deliberately uses the same Grok OAuth provider and model as the
+default profile. The model template contains the commented future switch to
+the keyless OpenAI-compatible Ollama endpoint:
+
+```yaml
+# provider: custom
+# default: qwen3.6:35b-a3b
+# base_url: http://100.103.129.82:11434/v1
+# api_mode: chat_completions
+```
+
+For terminal use, select it explicitly with either:
+
+```bash
+factory-ops chat
+hermes -p factory-ops chat
+```
+
+Do not run `hermes profile use factory-ops`; that would make it the sticky
+machine default. The general/default profile must remain selected by default
+and must not receive this playbook.
+
+### Selecting the profile in the Web UI
+
+In the installed Web UI at `http://100.123.208.90:8788`, click the profile chip
+in the composer footer, choose `factory-ops`, and start a new chat. The
+selection is browser-cookie scoped and the UI reloads that profile's model,
+skills, memory, and sessions. Choose `default` in the same picker to return to
+the general assistant.
+
+The native Hermes dashboard served at `http://100.123.208.90:9119` also has a
+profile switcher in its sidebar. Select `factory-ops`, or open the deep link
+`http://100.123.208.90:9119/?profile=factory-ops`; its Chat tab then launches
+under that profile.
+
+### Selecting the profile in Telegram
+
+Telegram routing is location-based, not a user-issued profile switch.
+`/profile` only reports the profile serving the current chat; there is no
+`/profile factory-ops` command.
+
+The clean single-bot setup is a dedicated private Telegram group for pipeline
+operations. After a Telegram bot token and messaging gateway are configured,
+enable multiplexing in the default `/home/alireza/.hermes/config.yaml` and
+route that group's numeric `chat_id`:
+
+```yaml
+gateway:
+  multiplex_profiles: true
+  profile_routes:
+    - name: factory-ops-telegram
+      platform: telegram
+      chat_id: "<dedicated-private-group-chat-id>"
+      profile: factory-ops
+```
+
+Restart the messaging gateway after adding the route. The user selects
+`factory-ops` simply by messaging the bot in that dedicated group; messages to
+unmatched chats continue to use the default profile. Send `/profile` in the
+group to verify that Hermes reports `factory-ops`.
+
+A single private DM with one bot has only one Telegram `chat_id`, so it cannot
+toggle profiles cleanly. If two separate one-to-one bot conversations are
+preferred, create a second Telegram bot token for `factory-ops`, place it only
+in `/home/alireza/.hermes/profiles/factory-ops/.env`, and run a separate
+`hermes -p factory-ops gateway` service. The original bot remains attached to
+the default profile.

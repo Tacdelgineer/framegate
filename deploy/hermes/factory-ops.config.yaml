@@ -1,0 +1,19 @@
+# Hermes profile configuration for ~/.hermes/profiles/factory-ops.
+# The xAI OAuth grant is read from the global ~/.hermes/auth.json fallback,
+# so this profile does not need a copied token or profile-local secret.
+model:
+  provider: xai-oauth
+  default: grok-build-0.1
+  base_url: ""
+
+  # Future Ollama switch (OpenAI-compatible endpoint):
+  # provider: custom
+  # default: qwen3.6:35b-a3b
+  # base_url: http://100.103.129.82:11434/v1
+  # api_mode: chat_completions
+
+terminal:
+  backend: local
+  cwd: /home/alireza/content-factory
+
+_config_version: 33
