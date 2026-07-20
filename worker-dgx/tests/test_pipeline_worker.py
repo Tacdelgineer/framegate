@@ -475,6 +475,29 @@ class VisualJobTests(unittest.TestCase):
         )
         self.assertIn("-shortest", mux_command)
 
+    def test_video_uses_pipeline_frame_count_contract(self) -> None:
+        self.assertEqual(
+            self.processor._video_timing(
+                {
+                    "duration_seconds": 7.194666666666667,
+                    "frame_count": 117,
+                    "fps": 16,
+                }
+            ),
+            (117, 7.194666666666667),
+        )
+        with self.assertRaisesRegex(
+            pipeline_worker.JobValidationError,
+            "4n\\+1",
+        ):
+            self.processor._video_timing(
+                {
+                    "duration_seconds": 7,
+                    "frame_count": 116,
+                    "fps": 16,
+                }
+            )
+
     def test_video_accepts_two_frames_and_selects_first_last_workflow(self) -> None:
         cases = (
             {
@@ -668,6 +691,76 @@ class WorkerModelCacheTests(unittest.TestCase):
             free_memory.call_args_list[1].args[0],
         )
         self.assertIsNone(self.worker.cached_model_family)
+
+
+class WorkerRetryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.config = dataclasses.replace(
+            pipeline_worker.Config.from_env(),
+            work_dir=Path(self.temporary.name) / "jobs",
+        )
+        self.worker = pipeline_worker.Worker(self.config)
+        self.job = {
+            "id": "job-1",
+            "type": "video",
+            "payload": {},
+            "claim_token": "claim-token",
+        }
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def test_payload_validation_fails_after_one_attempt(self) -> None:
+        error = pipeline_worker.JobValidationError(
+            "video payload requires exactly one or two input frames"
+        )
+        with (
+            mock.patch.object(
+                self.worker.processor,
+                "process",
+                side_effect=error,
+            ) as process,
+            mock.patch.object(self.worker.queue, "fail") as fail,
+            mock.patch.object(self.worker.stop_event, "wait") as wait,
+        ):
+            self.worker._run_job(self.job)
+
+        process.assert_called_once()
+        wait.assert_not_called()
+        fail.assert_called_once_with(
+            "job-1",
+            (
+                "JobValidationError: video payload requires exactly one or "
+                "two input frames"
+            ),
+            1,
+            "claim-token",
+        )
+
+    def test_transient_worker_failure_keeps_retry_backoff(self) -> None:
+        error = pipeline_worker.PipelineError(
+            "ComfyUI prompt abc timed out after 3600s"
+        )
+        with (
+            mock.patch.object(
+                self.worker.processor,
+                "process",
+                side_effect=error,
+            ) as process,
+            mock.patch.object(self.worker.queue, "fail") as fail,
+            mock.patch.object(self.worker.stop_event, "wait") as wait,
+        ):
+            self.worker._run_job(self.job)
+
+        self.assertEqual(process.call_count, 3)
+        self.assertEqual(wait.call_args_list, [mock.call(5), mock.call(10)])
+        fail.assert_called_once_with(
+            "job-1",
+            "PipelineError: ComfyUI prompt abc timed out after 3600s",
+            3,
+            "claim-token",
+        )
 
 
 if __name__ == "__main__":

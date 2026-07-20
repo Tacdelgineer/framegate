@@ -114,9 +114,10 @@ generation cap when `frame_count` is explicitly capped at 129; assembly holds
 the last generated frame for the remaining narration. Legacy `seconds`
 remains an alias when `frame_count` is omitted.
 
-Queue-native multipart inputs are also supported. Use role `frame` (or
-`start_frame` and optional `end_frame`) for video and `audio` for
-transcription. Assembly must provide ordered `clip_roles` (for example,
+Queue-native multipart inputs are also supported. Use `start_frame` and
+optional `end_frame` for video and `audio` for transcription. Multipart upload
+field names are `input:start_frame` followed by optional `input:end_frame`.
+Assembly must provide ordered `clip_roles` (for example,
 `["clip_1", "clip_2"]`) plus `voiceover_role` and optional `captions_role`;
 the worker resolves uploads in the declared order. During final muxing the
 worker clone-pads the last video frame with `tpad` before applying

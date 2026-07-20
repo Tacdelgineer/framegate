@@ -51,8 +51,8 @@ The news pipeline uses these job types and file roles:
 | --- | --- | --- |
 | `frame` | none | generated PNG frame |
 | `tts` | none | one shot's generated WAV audio |
-| `video` (I2V) | `frame` | narration-timed generated MP4 clip |
-| `video` (first/last) | `first_frame`, `last_frame` | narration-timed generated MP4 clip |
+| `video` (I2V) | `start_frame` | narration-timed generated MP4 clip |
+| `video` (first/last) | `start_frame`, `end_frame` | narration-timed generated MP4 clip |
 | `transcribe` | `audio` | transcript file |
 | `assemble` | `clip_1`…`clip_N`, `voiceover`, `captions` | assembled video |
 

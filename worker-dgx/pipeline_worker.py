@@ -47,6 +47,10 @@ class PipelineError(RuntimeError):
     """A job or service failed in an expected, reportable way."""
 
 
+class JobValidationError(PipelineError):
+    """A deterministic job payload rejection that should not be retried."""
+
+
 class NoJobAvailable(Exception):
     """The queue has no work for this worker."""
 
@@ -652,7 +656,7 @@ class JobProcessor:
         job_type = str(job["type"]).lower()
         payload = job.get("payload") or job.get("input") or {}
         if not isinstance(payload, dict):
-            raise PipelineError("Job payload/input must be an object")
+            raise JobValidationError("Job payload/input must be an object")
         payload = dict(payload)
         self._inject_queue_inputs(job_type, payload, job.get("input_files"))
         if job_type == "tts":
@@ -665,7 +669,7 @@ class JobProcessor:
             return self.frame(payload, work_dir)
         if job_type == "video":
             return self.video(payload, work_dir)
-        raise PipelineError(f"Unsupported job type: {job_type}")
+        raise JobValidationError(f"Unsupported job type: {job_type}")
 
     def _free_comfyui_memory(self, reason: str) -> None:
         try:
@@ -827,9 +831,13 @@ class JobProcessor:
     def _prompt(payload: dict[str, Any], job_type: str) -> str:
         prompt = str(payload.get("prompt") or "").strip()
         if not prompt:
-            raise PipelineError(f"{job_type} payload requires a non-empty prompt")
+            raise JobValidationError(
+                f"{job_type} payload requires a non-empty prompt"
+            )
         if len(prompt) > 20_000:
-            raise PipelineError(f"{job_type} prompt exceeds 20,000 characters")
+            raise JobValidationError(
+                f"{job_type} prompt exceeds 20,000 characters"
+            )
         return prompt
 
     @staticmethod
@@ -838,13 +846,15 @@ class JobProcessor:
         if raw is None:
             return uuid.uuid4().int & ((1 << 63) - 1)
         if isinstance(raw, bool):
-            raise PipelineError("seed must be an integer")
+            raise JobValidationError("seed must be an integer")
         try:
             seed = int(raw)
         except (TypeError, ValueError) as exc:
-            raise PipelineError("seed must be an integer") from exc
+            raise JobValidationError("seed must be an integer") from exc
         if not 0 <= seed <= 18_446_744_073_709_551_615:
-            raise PipelineError("seed is outside the unsigned 64-bit range")
+            raise JobValidationError(
+                "seed is outside the unsigned 64-bit range"
+            )
         return seed
 
     @staticmethod
@@ -894,19 +904,25 @@ class JobProcessor:
                         return JobProcessor._frame_url(nested, label)
                     except PipelineError:
                         pass
-        raise PipelineError(f"{label} must be an http(s) URL or file object")
+        raise JobValidationError(
+            f"{label} must be an http(s) URL or file object"
+        )
 
     @classmethod
     def _video_frame_urls(cls, payload: dict[str, Any]) -> list[str]:
         plural = payload.get("frames")
         singular = payload.get("frame")
         if plural is not None and singular is not None:
-            raise PipelineError("video payload cannot contain both frame and frames")
+            raise JobValidationError(
+                "video payload cannot contain both frame and frames"
+            )
 
         raw_frames: list[Any]
         if plural is not None:
             if not isinstance(plural, list):
-                raise PipelineError("video frames must be a list of one or two URLs")
+                raise JobValidationError(
+                    "video frames must be a list of one or two URLs"
+                )
             raw_frames = plural
         elif singular is not None:
             raw_frames = singular if isinstance(singular, list) else [singular]
@@ -917,7 +933,9 @@ class JobProcessor:
                 if payload.get(key) is not None
             ]
             if len(start_values) > 1:
-                raise PipelineError("video payload has multiple start-frame aliases")
+                raise JobValidationError(
+                    "video payload has multiple start-frame aliases"
+                )
             raw_frames = start_values
 
         end_values = [
@@ -926,16 +944,20 @@ class JobProcessor:
             if payload.get(key) is not None
         ]
         if len(end_values) > 1:
-            raise PipelineError("video payload has multiple end-frame aliases")
+            raise JobValidationError(
+                "video payload has multiple end-frame aliases"
+            )
         if end_values:
             if len(raw_frames) != 1:
-                raise PipelineError(
+                raise JobValidationError(
                     "end_frame/end_frame_url requires exactly one start frame"
                 )
             raw_frames.append(end_values[0])
 
         if len(raw_frames) not in {1, 2}:
-            raise PipelineError("video payload requires exactly one or two input frames")
+            raise JobValidationError(
+                "video payload requires exactly one or two input frames"
+            )
         return [
             cls._frame_url(value, f"video frame {index}")
             for index, value in enumerate(raw_frames, 1)
@@ -945,30 +967,32 @@ class JobProcessor:
     def _video_timing(payload: dict[str, Any]) -> tuple[int, float]:
         raw_fps = payload.get("fps", VIDEO_FPS)
         if isinstance(raw_fps, bool):
-            raise PipelineError(f"video fps must be {VIDEO_FPS}")
+            raise JobValidationError(f"video fps must be {VIDEO_FPS}")
         try:
             fps = float(raw_fps)
         except (TypeError, ValueError) as exc:
-            raise PipelineError(f"video fps must be {VIDEO_FPS}") from exc
+            raise JobValidationError(f"video fps must be {VIDEO_FPS}") from exc
         if fps != VIDEO_FPS:
-            raise PipelineError(f"video fps must be {VIDEO_FPS}; got {raw_fps!r}")
+            raise JobValidationError(
+                f"video fps must be {VIDEO_FPS}; got {raw_fps!r}"
+            )
 
         raw_frame_count = payload.get("frame_count")
         if raw_frame_count is not None:
             if isinstance(raw_frame_count, bool) or not isinstance(
                 raw_frame_count, int
             ):
-                raise PipelineError(
+                raise JobValidationError(
                     "video frame_count must be an integer in Wan's 4n+1 form"
                 )
             frame_count = raw_frame_count
             if frame_count > VIDEO_MAX_FRAME_COUNT:
-                raise PipelineError(
+                raise JobValidationError(
                     "video frame_count exceeds the 8s cap of "
                     f"{VIDEO_MAX_FRAME_COUNT} frames; got {frame_count}"
                 )
             if frame_count < 1 or (frame_count - 1) % 4:
-                raise PipelineError(
+                raise JobValidationError(
                     "video frame_count must be a positive 4n+1 value "
                     f"at {VIDEO_FPS} fps; got {frame_count}"
                 )
@@ -980,24 +1004,24 @@ class JobProcessor:
             seconds = 5.0
         else:
             if isinstance(raw_seconds, bool):
-                raise PipelineError(
+                raise JobValidationError(
                     "video duration_seconds must be a positive number"
                 )
             try:
                 seconds = float(raw_seconds)
             except (TypeError, ValueError) as exc:
-                raise PipelineError(
+                raise JobValidationError(
                     "video duration_seconds must be a positive number"
                 ) from exc
             if not math.isfinite(seconds) or seconds <= 0:
-                raise PipelineError(
+                raise JobValidationError(
                     "video duration_seconds must be a positive number"
                 )
 
         if raw_frame_count is None:
             frame_count = math.ceil(seconds * VIDEO_FPS / 4) * 4 + 1
             if frame_count > VIDEO_MAX_FRAME_COUNT:
-                raise PipelineError(
+                raise JobValidationError(
                     "video duration_seconds requires a frame_count above "
                     f"the 8s cap of {VIDEO_MAX_FRAME_COUNT} frames"
                 )
@@ -1026,9 +1050,13 @@ class JobProcessor:
         self, payload: dict[str, Any], work_dir: Path
     ) -> tuple[Path, dict[str, Any]]:
         prompt = self._prompt(payload, "frame")
-        aspect = str(payload.get("aspect") or "9:16")
+        aspect = str(
+            payload.get("aspect_ratio") or payload.get("aspect") or "9:16"
+        )
         if aspect != "9:16":
-            raise PipelineError("frame currently supports only aspect='9:16'")
+            raise JobValidationError(
+                "frame currently supports only aspect_ratio='9:16'"
+            )
         available_gb = self._require_visual_headroom()
         seed = self._seed(payload)
         graph = self.comfyui.load_workflow("flux2_klein_frame_api.json")
@@ -1066,12 +1094,12 @@ class JobProcessor:
     ) -> tuple[Path, dict[str, Any]]:
         prompt = self._prompt(payload, "video")
         aspect = str(
-            payload.get("aspect")
-            or payload.get("aspect_ratio")
-            or "9:16"
+            payload.get("aspect_ratio") or payload.get("aspect") or "9:16"
         )
         if aspect != "9:16":
-            raise PipelineError("video currently supports only aspect='9:16'")
+            raise JobValidationError(
+                "video currently supports only aspect_ratio='9:16'"
+            )
         frame_urls = self._video_frame_urls(payload)
         frame_count, seconds = self._video_timing(payload)
         available_gb = self._require_visual_headroom()
@@ -1144,26 +1172,26 @@ class JobProcessor:
     ) -> tuple[Path, dict[str, Any]]:
         text = str(payload.get("text") or "").strip()
         if not text:
-            raise PipelineError("tts payload requires non-empty text")
+            raise JobValidationError("tts payload requires non-empty text")
         if len(text) > 20_000:
-            raise PipelineError("tts text exceeds 20,000 characters")
+            raise JobValidationError("tts text exceeds 20,000 characters")
         uses_voice_ref = "voice_ref" in payload or "voice_ref_text" in payload
         if uses_voice_ref:
             voice_ref = payload.get("voice_ref")
             voice_ref_text = payload.get("voice_ref_text")
             if not isinstance(voice_ref, str) or not voice_ref.strip():
-                raise PipelineError(
+                raise JobValidationError(
                     "tts voice_ref must be a non-empty path when voice_ref_text is set"
                 )
             if not isinstance(voice_ref_text, str) or not voice_ref_text.strip():
-                raise PipelineError(
+                raise JobValidationError(
                     "tts voice_ref_text must be non-empty when voice_ref is set"
                 )
             if any(
                 payload.get(key)
                 for key in ("ref_audio_url", "ref_audio_path", "ref_text")
             ):
-                raise PipelineError(
+                raise JobValidationError(
                     "tts voice_ref/voice_ref_text cannot be combined with legacy "
                     "reference fields"
                 )
@@ -1189,9 +1217,12 @@ class JobProcessor:
                 self.config.default_ref_audio, Path("/srv/ai/assets")
             )
             ref_text = self.config.default_ref_text
-        speed = float(payload.get("speed", 1.0))
+        try:
+            speed = float(payload.get("speed", 1.0))
+        except (TypeError, ValueError) as exc:
+            raise JobValidationError("tts speed must be a number") from exc
         if not 0.5 <= speed <= 2.0:
-            raise PipelineError("tts speed must be between 0.5 and 2.0")
+            raise JobValidationError("tts speed must be between 0.5 and 2.0")
         base_url = self.f5tts.ensure_started("/healthz", min(180, self.config.inference_timeout))
         request = {
             "text": text,
@@ -1225,7 +1256,7 @@ class JobProcessor:
     ) -> tuple[Path, dict[str, Any]]:
         audio_url = payload.get("audio_url") or payload.get("url")
         if not audio_url:
-            raise PipelineError("transcribe payload requires audio_url")
+            raise JobValidationError("transcribe payload requires audio_url")
         suffix = Path(urllib.parse.urlparse(str(audio_url)).path).suffix or ".wav"
         audio_path = self.download(str(audio_url), work_dir / f"input{suffix}")
         base_url = self.whisper.ensure_started(
@@ -1270,22 +1301,26 @@ class JobProcessor:
     ) -> tuple[Path, dict[str, Any]]:
         clips = payload.get("clips") or payload.get("clip_urls")
         if not isinstance(clips, list) or not clips:
-            raise PipelineError("assemble payload requires a non-empty clips list")
+            raise JobValidationError(
+                "assemble payload requires a non-empty clips list"
+            )
         if len(clips) > 100:
-            raise PipelineError("assemble accepts at most 100 clips")
+            raise JobValidationError("assemble accepts at most 100 clips")
         voiceover_url = (
             payload.get("voiceover_url")
             or payload.get("vo_url")
             or payload.get("audio_url")
         )
         if not voiceover_url:
-            raise PipelineError("assemble payload requires voiceover_url/vo_url")
+            raise JobValidationError(
+                "assemble payload requires voiceover_url/vo_url"
+            )
 
         normalized: list[Path] = []
         for index, clip in enumerate(clips):
             clip_url = clip.get("url") if isinstance(clip, dict) else clip
             if not clip_url:
-                raise PipelineError(f"Clip {index} has no URL")
+                raise JobValidationError(f"Clip {index} has no URL")
             suffix = Path(urllib.parse.urlparse(str(clip_url)).path).suffix or ".mp4"
             source = self.download(str(clip_url), work_dir / f"clip-{index:03d}{suffix}")
             target = work_dir / f"normalized-{index:03d}.mp4"
@@ -1431,7 +1466,9 @@ class JobProcessor:
         if isinstance(captions, dict):
             captions = captions.get("segments") or captions.get("words") or []
         if not isinstance(captions, list):
-            raise PipelineError("captions must be a list or transcription JSON object")
+            raise JobValidationError(
+                "captions must be a list or transcription JSON object"
+            )
         normalized = []
         for item in captions:
             if not isinstance(item, dict):
@@ -1646,7 +1683,10 @@ class Worker:
         LOG.info("Claimed job %s (%s)", job_id, job_type)
 
         last_error = "unknown error"
+        attempts_used = 0
+        succeeded = False
         for attempt in range(1, 4):
+            attempts_used = attempt
             with self.state_lock:
                 self.state.current_attempt = attempt
             try:
@@ -1663,6 +1703,17 @@ class Worker:
                     attempt,
                     artifact,
                 )
+                succeeded = True
+                break
+            except JobValidationError as exc:
+                last_error = compact_error(exc)
+                LOG.error(
+                    "Job %s failed payload validation on attempt %d/3; "
+                    "not retrying: %s",
+                    job_id,
+                    attempt,
+                    last_error,
+                )
                 break
             except Exception as exc:
                 last_error = compact_error(exc)
@@ -1674,19 +1725,29 @@ class Worker:
                 )
                 if attempt < 3:
                     self.stop_event.wait(min(5 * attempt, 10))
-        else:
+        if not succeeded:
             with self.state_lock:
                 self.state.jobs_failed += 1
                 self.state.last_error = last_error
             try:
-                self.queue.fail(job_id, last_error, 3, claim_token)
+                self.queue.fail(
+                    job_id,
+                    last_error,
+                    attempts_used,
+                    claim_token,
+                )
             except PipelineError as exc:
                 LOG.error(
                     "Could not report final failure for %s: %s",
                     job_id,
                     compact_error(exc),
                 )
-            LOG.error("Job %s failed after two retries", job_id)
+            LOG.error(
+                "Job %s failed after %d attempt%s",
+                job_id,
+                attempts_used,
+                "" if attempts_used == 1 else "s",
+            )
         with self.state_lock:
             self.state.current_job_id = None
             self.state.current_job_type = None

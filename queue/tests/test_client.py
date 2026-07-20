@@ -80,6 +80,9 @@ def test_client_raises_worker_error() -> None:
             client.wait("job-2")
         except JobFailedError as exc:
             assert "bad audio" in str(exc)
+            assert exc.job_id == "job-2"
+            assert exc.job_type == "transcribe"
+            assert exc.worker_error == "bad audio"
         else:
             raise AssertionError("expected JobFailedError")
     finally:

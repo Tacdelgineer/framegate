@@ -214,6 +214,59 @@ def clip_timing(
     }
 
 
+def build_local_video_job(
+    *,
+    mode: str,
+    first_frame: Path,
+    last_frame: Path | None,
+    prompt: str,
+    negative_prompt: str,
+    resolution: str,
+    steps: int,
+    seed: int,
+    duration_seconds: float,
+    frame_count: int,
+    fps: int = WAN_FPS,
+) -> tuple[dict[str, Any], dict[str, Path]]:
+    """Build the canonical queue-native worker payload for one video clip."""
+    if mode not in {"i2v", "flf"}:
+        raise ValueError(f"Unsupported local video mode: {mode!r}")
+    if mode == "i2v" and last_frame is not None:
+        raise ValueError("I2V video jobs accept exactly one input frame")
+    if mode == "flf" and last_frame is None:
+        raise ValueError("FLF video jobs require start and end frames")
+    if duration_seconds <= 0:
+        raise ValueError("Video duration_seconds must be positive")
+    if fps != WAN_FPS:
+        raise ValueError(f"Local Wan video jobs require {WAN_FPS}fps")
+    if (
+        isinstance(frame_count, bool)
+        or not isinstance(frame_count, int)
+        or frame_count < WAN_FRAME_OFFSET
+        or (frame_count - WAN_FRAME_OFFSET) % WAN_FRAME_STRIDE
+    ):
+        raise ValueError("Local Wan frame_count must have the 4n+1 shape")
+
+    payload: dict[str, Any] = {
+        "mode": mode,
+        "prompt": prompt,
+        "motion_instruction": prompt,
+        "negative_prompt": negative_prompt,
+        "resolution": resolution,
+        "steps": steps,
+        "seed": seed,
+        "duration_seconds": duration_seconds,
+        "frame_count": frame_count,
+        "fps": fps,
+        "aspect_ratio": "9:16",
+        "output_format": "mp4",
+    }
+    input_files = {"start_frame": first_frame}
+    if last_frame is not None:
+        input_files["end_frame"] = last_frame
+    return payload, input_files
+
+
 def wav_duration_seconds(path: Path) -> float:
     try:
         with wave.open(str(path), "rb") as source:
@@ -965,6 +1018,22 @@ class RemoteAPIError(RuntimeError):
     pass
 
 
+class NonRetryableWorkerError(RuntimeError):
+    """A deterministic worker rejection that stage retries cannot repair."""
+
+
+def is_worker_validation_error(exc: JobFailedError) -> bool:
+    worker_error = getattr(exc, "worker_error", "") or str(exc)
+    if worker_error.startswith("JobValidationError:"):
+        return True
+    # Compatibility with workers deployed before validation errors had their
+    # own exception type. Keep this deliberately exact so memory gates,
+    # timeouts, and other transient PipelineError failures still retry.
+    return worker_error == (
+        "PipelineError: video payload requires exactly one or two input frames"
+    )
+
+
 class NewsPipeline:
     def __init__(
         self,
@@ -1625,31 +1694,22 @@ Requirements:
                     shot.get("motion_instruction") or shot.get("visual_prompt") or ""
                 ).strip()
                 if self.visuals == "local":
-                    input_files = (
-                        {"frame": first_frame}
-                        if mode == "i2v"
-                        else {
-                            "first_frame": first_frame,
-                            "last_frame": last_frame,
-                        }
+                    payload, input_files = build_local_video_job(
+                        mode=mode,
+                        first_frame=first_frame,
+                        last_frame=last_frame,
+                        prompt=motion,
+                        negative_prompt=self.config.negative_prompt,
+                        resolution=self.config.video_resolution,
+                        steps=self.config.steps_final,
+                        seed=new_seed(),
+                        duration_seconds=float(timing["clip_seconds"]),
+                        frame_count=int(timing["frame_count"]),
                     )
                     self._queue_job(
                         f"video:{index}",
                         "video",
-                        {
-                            "mode": mode,
-                            "prompt": motion,
-                            "motion_instruction": motion,
-                            "negative_prompt": self.config.negative_prompt,
-                            "resolution": self.config.video_resolution,
-                            "steps": self.config.steps_final,
-                            "seed": new_seed(),
-                            "duration_seconds": timing["clip_seconds"],
-                            "frame_count": timing["frame_count"],
-                            "fps": WAN_FPS,
-                            "aspect_ratio": "9:16",
-                            "output_format": "mp4",
-                        },
+                        payload,
                         input_files,
                         path,
                     )
@@ -1727,9 +1787,17 @@ Requirements:
                 output_path=output_path,
                 timeout=self.settings.queue_timeout,
             )
-        except JobFailedError:
+        except JobFailedError as exc:
             jobs.pop(key, None)
             self.store.update_run(self.run_id, queue_jobs_json=json.dumps(jobs))
+            if is_worker_validation_error(exc):
+                match = re.fullmatch(r"video:(\d+)", key)
+                label = f"Shot {match.group(1)}" if match else key
+                detail = getattr(exc, "worker_error", "") or str(exc)
+                raise NonRetryableWorkerError(
+                    f"{label} was rejected by worker payload validation; "
+                    f"not retrying: {detail}"
+                ) from exc
             raise
 
     def _rewrite_long_narration(
@@ -2754,6 +2822,9 @@ Return exactly:
                 error = f"{type(exc).__name__}: {exc}"
                 self.store.finish_attempt(attempt_id, "failed", error)
                 self.store.update_run(self.run_id, last_error=error)
+                if isinstance(exc, NonRetryableWorkerError):
+                    LOG.error("Stage %s failed permanently: %s", stage, error)
+                    raise
                 if retry == 3:
                     raise
                 delay = self.settings.retry_base_seconds * (2 ** (retry - 1))

@@ -90,10 +90,11 @@ only that frame. Final-video Regenerate deletes generated media, rewinds to
   `voice_ref` and `voice_ref_text`. Each result is stored under `voiceover/`
   and all active results are joined into `voiceover.wav` with 0.5 seconds of
   silent tail room.
-- `video`: input role `frame` for I2V, or `first_frame` and `last_frame` for
-  first/last-frame mode; payload contains the motion instruction, resolution,
-  final steps, seed, narration-derived `duration_seconds`, `frame_count`, and
-  16fps input rate.
+- `video`: input role `start_frame` for I2V, followed by `end_frame` for
+  first/last-frame mode. The queue client uploads those as
+  `input:start_frame` and optional `input:end_frame`; payload contains the
+  motion instruction, resolution, final steps, seed, narration-derived
+  `duration_seconds`, `frame_count`, and 16fps input rate.
 - `transcribe`: input role `audio`, result downloaded to `captions.srt`.
 - `assemble`: dynamic input roles `clip_1` through `clip_N`, `voiceover`, and
   `captions`; 16fps clips pass through ffmpeg `minterpolate` to the configured

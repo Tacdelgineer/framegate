@@ -18,6 +18,13 @@ class JobQueueError(RuntimeError):
 class JobFailedError(JobQueueError):
     """Raised when a worker marks a job as failed."""
 
+    def __init__(self, message: str, *, job: Mapping[str, Any] | None = None):
+        super().__init__(message)
+        self.job = dict(job or {})
+        self.job_id = str(self.job.get("id") or "")
+        self.job_type = str(self.job.get("job_type") or self.job.get("type") or "")
+        self.worker_error = str(self.job.get("error") or "")
+
 
 class JobQueueClient:
     """Synchronous client used by the VPS news pipeline."""
@@ -120,7 +127,8 @@ class JobQueueClient:
             if job["status"] == "failed":
                 raise JobFailedError(
                     f"Remote {job['job_type']} job {job_id} failed: "
-                    f"{job.get('error') or 'unknown worker error'}"
+                    f"{job.get('error') or 'unknown worker error'}",
+                    job=job,
                 )
             if job["status"] == "done":
                 if output_path is not None:

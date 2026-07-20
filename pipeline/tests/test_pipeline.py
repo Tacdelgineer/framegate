@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import base64
+import importlib.util
 import json
+import re
+import sys
 import wave
 from dataclasses import replace
 from pathlib import Path
@@ -10,6 +13,19 @@ import httpx
 import pytest
 
 import news_pipeline as module
+
+
+def load_worker_contract_module():
+    name = "content_factory_worker_contract"
+    if name in sys.modules:
+        return sys.modules[name]
+    path = module.MONOREPO_ROOT / "worker-dgx" / "pipeline_worker.py"
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None and spec.loader is not None
+    worker = importlib.util.module_from_spec(spec)
+    sys.modules[name] = worker
+    spec.loader.exec_module(worker)
+    return worker
 
 
 def write_wav(path: Path, duration_seconds: float, sample_rate: int = 1000) -> None:
@@ -272,6 +288,123 @@ def test_stage_retries_three_times_and_preserves_previous_state(
             "SELECT outcome FROM stage_attempts ORDER BY id"
         ).fetchall()
     assert [row["outcome"] for row in outcomes] == ["failed"] * 3
+
+
+def test_stage_does_not_retry_non_transient_worker_validation(
+    tmp_path: Path,
+) -> None:
+    config = settings(tmp_path)
+    store = module.StateStore(config.database_path)
+    run = store.create_run("test")
+    pipeline = DryRunPipeline(config, store, run, queue_client=FakeQueue())
+    calls = 0
+
+    def fail() -> None:
+        nonlocal calls
+        calls += 1
+        raise module.NonRetryableWorkerError(
+            "Shot 9 was rejected by worker payload validation"
+        )
+
+    try:
+        with pytest.raises(
+            module.NonRetryableWorkerError,
+            match="Shot 9",
+        ):
+            pipeline.run_stage("generate_clips", fail)
+    finally:
+        pipeline.close()
+
+    assert calls == 1
+    with store.connect() as connection:
+        outcomes = connection.execute(
+            "SELECT outcome FROM stage_attempts ORDER BY id"
+        ).fetchall()
+    assert [row["outcome"] for row in outcomes] == ["failed"]
+
+
+def test_worker_error_classification_preserves_transient_retries() -> None:
+    validation = module.JobFailedError(
+        "validation",
+        job={
+            "error": (
+                "JobValidationError: video payload requires exactly one or "
+                "two input frames"
+            )
+        },
+    )
+    legacy_validation = module.JobFailedError(
+        "validation",
+        job={
+            "error": (
+                "PipelineError: video payload requires exactly one or two "
+                "input frames"
+            )
+        },
+    )
+    memory_gate = module.JobFailedError(
+        "memory",
+        job={
+            "error": (
+                "PipelineError: Visual job requires 40.0 GiB MemAvailable; "
+                "only 32.0 GiB is available after ComfyUI cleanup"
+            )
+        },
+    )
+    timeout = module.JobFailedError(
+        "timeout",
+        job={"error": "PipelineError: ComfyUI prompt abc timed out after 3600s"},
+    )
+
+    assert module.is_worker_validation_error(validation)
+    assert module.is_worker_validation_error(legacy_validation)
+    assert not module.is_worker_validation_error(memory_gate)
+    assert not module.is_worker_validation_error(timeout)
+
+
+def test_queue_job_reports_non_retryable_validation_for_the_shot(
+    tmp_path: Path,
+) -> None:
+    config = settings(tmp_path)
+    store = module.StateStore(config.database_path)
+    run = store.create_run("test")
+    queue = RecordingQueue()
+
+    def reject(*_args, **_kwargs):
+        raise module.JobFailedError(
+            "worker rejected video",
+            job={
+                "id": "job-1",
+                "job_type": "video",
+                "status": "failed",
+                "error": (
+                    "JobValidationError: video payload requires exactly one "
+                    "or two input frames"
+                ),
+            },
+        )
+
+    queue.wait = reject
+    pipeline = DryRunPipeline(config, store, run, queue_client=queue)
+    try:
+        with pytest.raises(
+            module.NonRetryableWorkerError,
+            match=(
+                "Shot 9 was rejected by worker payload validation; "
+                "not retrying"
+            ),
+        ):
+            pipeline._queue_job(
+                "video:9",
+                "video",
+                {"prompt": "slow pull back"},
+                {"start_frame": tmp_path / "start.png"},
+                tmp_path / "shot-09.mp4",
+            )
+    finally:
+        pipeline.close()
+
+    assert json.loads(store.get_run(run["id"])["queue_jobs_json"]) == {}
 
 
 def test_narration_timing_rounds_to_wan_frames_and_honors_cap() -> None:
@@ -902,10 +1035,94 @@ def test_local_visuals_enqueue_frame_and_video_jobs(tmp_path: Path) -> None:
     assert isinstance(frame_job["payload"]["seed"], int)
     assert frame_job["payload"]["prompt"].startswith(module.DEFAULT_STYLE_BLOCK)
     video_jobs = queue.submissions[11:]
-    assert all(set(job["input_files"]) == {"frame"} for job in video_jobs)
+    assert all(set(job["input_files"]) == {"start_frame"} for job in video_jobs)
     assert all(job["payload"]["fps"] == 16 for job in video_jobs)
     assert all(job["payload"]["frame_count"] == 105 for job in video_jobs)
     assert all(job["payload"]["duration_seconds"] == 6.4 for job in video_jobs)
+
+
+@pytest.mark.parametrize(
+    ("mode", "with_last_frame", "expected_roles", "expected_frame_count"),
+    [
+        ("i2v", False, ["start_frame"], 89),
+        ("flf", True, ["start_frame", "end_frame"], 117),
+    ],
+)
+def test_video_job_builder_matches_worker_contract(
+    tmp_path: Path,
+    mode: str,
+    with_last_frame: bool,
+    expected_roles: list[str],
+    expected_frame_count: int,
+) -> None:
+    first_frame = tmp_path / "start.png"
+    last_frame = tmp_path / "end.png" if with_last_frame else None
+    first_frame.write_bytes(b"start")
+    if last_frame is not None:
+        last_frame.write_bytes(b"end")
+    payload, input_files = module.build_local_video_job(
+        mode=mode,
+        first_frame=first_frame,
+        last_frame=last_frame,
+        prompt="slow pull back",
+        negative_prompt="text",
+        resolution="720p",
+        steps=8,
+        seed=42,
+        duration_seconds=expected_frame_count / module.WAN_FPS,
+        frame_count=expected_frame_count,
+    )
+
+    assert list(input_files) == expected_roles
+    assert payload["frame_count"] == expected_frame_count
+    assert payload["fps"] == 16
+    assert payload["aspect_ratio"] == "9:16"
+    assert "frame" not in payload and "frames" not in payload
+
+    request_body = b""
+
+    def capture(request: httpx.Request) -> httpx.Response:
+        nonlocal request_body
+        request_body = request.content
+        return httpx.Response(201, json={"id": "job-1", "status": "pending"})
+
+    queue = module.JobQueueClient("http://queue")
+    queue._client.close()
+    queue._client = httpx.Client(
+        base_url="http://queue",
+        transport=httpx.MockTransport(capture),
+    )
+    try:
+        queue.submit("video", payload, input_files=input_files)
+    finally:
+        queue.close()
+    multipart_roles = re.findall(rb'name="(input:[^"]+)"', request_body)
+    assert multipart_roles == [
+        f"input:{role}".encode() for role in expected_roles
+    ]
+
+    worker = load_worker_contract_module()
+    worker_payload = dict(payload)
+    queue_files = [
+        {
+            "role": role,
+            "download_url": f"https://queue.test/{position}.png",
+        }
+        for position, role in enumerate(input_files, start=1)
+    ]
+    worker.JobProcessor._inject_queue_inputs(
+        "video",
+        worker_payload,
+        queue_files,
+    )
+    assert worker.JobProcessor._video_frame_urls(worker_payload) == [
+        item["download_url"] for item in queue_files
+    ]
+    assert worker.JobProcessor._video_timing(worker_payload) == (
+        expected_frame_count / module.WAN_FPS,
+        16,
+        expected_frame_count,
+    )
 
 
 def test_flf_uses_two_approved_frames_per_video(tmp_path: Path) -> None:
@@ -954,7 +1171,7 @@ def test_flf_uses_two_approved_frames_per_video(tmp_path: Path) -> None:
 
     assert [job["job_type"] for job in queue.submissions[6:16]] == ["frame"] * 10
     assert all(
-        set(job["input_files"]) == {"first_frame", "last_frame"}
+        list(job["input_files"]) == ["start_frame", "end_frame"]
         for job in queue.submissions[16:]
     )
 
