@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import json
 import base64
+import json
+import wave
 from dataclasses import replace
 from pathlib import Path
 
@@ -11,27 +12,40 @@ import pytest
 import news_pipeline as module
 
 
+def write_wav(path: Path, duration_seconds: float, sample_rate: int = 1000) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(path), "wb") as output:
+        output.setnchannels(1)
+        output.setsampwidth(2)
+        output.setframerate(sample_rate)
+        output.writeframes(b"\0\0" * round(duration_seconds * sample_rate))
+
+
 class FakeQueue:
     def close(self) -> None:
         pass
 
 
 class RecordingQueue(FakeQueue):
-    def __init__(self):
+    def __init__(self, tts_durations: list[float] | None = None):
         self.submissions = []
         self._jobs = {}
+        self.tts_durations = list(tts_durations or [])
 
     def submit(self, job_type, payload, *, input_files=None):
         job_id = f"job-{len(self.submissions) + 1}"
-        self.submissions.append(
-            {
-                "id": job_id,
-                "job_type": job_type,
-                "payload": payload,
-                "input_files": dict(input_files or {}),
-            }
-        )
-        self._jobs[job_id] = {"id": job_id, "status": "pending"}
+        submission = {
+            "id": job_id,
+            "job_type": job_type,
+            "payload": payload,
+            "input_files": dict(input_files or {}),
+        }
+        self.submissions.append(submission)
+        self._jobs[job_id] = {
+            "id": job_id,
+            "status": "pending",
+            "submission": submission,
+        }
         return self._jobs[job_id]
 
     def get(self, job_id):
@@ -40,7 +54,16 @@ class RecordingQueue(FakeQueue):
     def wait(self, job_id, *, output_path, timeout):
         path = Path(output_path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(f"result for {job_id}".encode())
+        submission = self._jobs[job_id]["submission"]
+        if submission["job_type"] == "tts":
+            duration = (
+                self.tts_durations.pop(0)
+                if self.tts_durations
+                else float(submission["payload"]["target_duration_seconds"])
+            )
+            write_wav(path, duration)
+        else:
+            path.write_bytes(f"result for {job_id}".encode())
         self._jobs[job_id]["status"] = "done"
         return self._jobs[job_id]
 
@@ -103,6 +126,39 @@ class DryRunPipeline(module.NewsPipeline):
             ),
         )
 
+    def generate_voiceover_and_captions(self) -> None:
+        shots = json.loads(self.current()["script_json"])["shots"]
+        paths = []
+        entries = {}
+        for index, shot in enumerate(shots, start=1):
+            path = self.run_dir / "voiceover" / f"shot_{index:02d}_attempt_1.wav"
+            write_wav(path, 5)
+            paths.append(path)
+            entries[str(index)] = {
+                "index": index,
+                "text": shot["voiceover_text"],
+                "path": str(path),
+                "duration_seconds": 5,
+                "tts_attempts": 1,
+                "shorten_retry_used": False,
+                "timing": module.clip_timing(
+                    5,
+                    clip_padding=self.config.clip_padding,
+                    max_clip_seconds=self.config.max_clip_seconds,
+                ),
+            }
+        voiceover = self.run_dir / "voiceover.wav"
+        module.concatenate_wavs(paths, voiceover)
+        captions = self.run_dir / "captions.srt"
+        captions.write_text("1\n00:00:00,000 --> 00:00:01,000\nTest\n")
+        self.store.update_run(
+            self.run_id,
+            status="voiced",
+            shot_audio_json=json.dumps({"version": 1, "shots": entries}),
+            voiceover_path=str(voiceover),
+            captions_path=str(captions),
+        )
+
     def generate_first_frames(self) -> None:
         frames = []
         for index in range(1, 6):
@@ -129,18 +185,51 @@ def test_dry_run_stops_after_framing_and_resumes(tmp_path: Path) -> None:
     assert result["status"] == "framed"
     assert len(json.loads(result["frames_json"])) == 5
     assert store.latest_resumable()["id"] == run["id"]
+    assert [
+        attempt["stage"] for attempt in store.attempts_for_run(run["id"])
+    ] == [
+        "fetch_story",
+        "write_script",
+        "generate_voiceover_and_captions",
+        "generate_first_frames",
+    ]
 
 
-def test_repair_rolls_missing_frames_back_to_scripted(tmp_path: Path) -> None:
+def test_repair_rolls_missing_frames_back_to_voiced(tmp_path: Path) -> None:
     config = settings(tmp_path)
     store = module.StateStore(config.database_path)
     run = store.create_run("test")
+    run_dir = config.work_root / run["id"]
+    shot_path = run_dir / "voiceover" / "shot_01_attempt_1.wav"
+    voiceover_path = run_dir / "voiceover.wav"
+    captions_path = run_dir / "captions.srt"
+    write_wav(shot_path, 5)
+    write_wav(voiceover_path, 5.5)
+    captions_path.write_text("captions")
     run = store.update_run(
         run["id"],
         status="framed",
         story_json="{}",
-        script_json='{"shots":[]}',
-        frames_json=json.dumps([str(tmp_path / "missing.png")] * 5),
+        script_json='{"shots":[{"voiceover_text":"Voice"}]}',
+        shot_audio_json=json.dumps(
+            {
+                "version": 1,
+                "shots": {
+                    "1": {
+                        "path": str(shot_path),
+                        "duration_seconds": 5,
+                        "timing": module.clip_timing(
+                            5,
+                            clip_padding=0.4,
+                            max_clip_seconds=8,
+                        ),
+                    }
+                },
+            }
+        ),
+        voiceover_path=str(voiceover_path),
+        captions_path=str(captions_path),
+        frames_json=json.dumps([str(tmp_path / "missing.png")]),
     )
     pipeline = DryRunPipeline(config, store, run, queue_client=FakeQueue())
     try:
@@ -148,7 +237,7 @@ def test_repair_rolls_missing_frames_back_to_scripted(tmp_path: Path) -> None:
     finally:
         pipeline.close()
     repaired = store.get_run(run["id"])
-    assert repaired["status"] == "scripted"
+    assert repaired["status"] == "voiced"
     assert json.loads(repaired["frames_json"]) == []
 
 
@@ -183,6 +272,43 @@ def test_stage_retries_three_times_and_preserves_previous_state(
             "SELECT outcome FROM stage_attempts ORDER BY id"
         ).fetchall()
     assert [row["outcome"] for row in outcomes] == ["failed"] * 3
+
+
+def test_narration_timing_rounds_to_wan_frames_and_honors_cap() -> None:
+    assert module.target_shot_count(45) == 9
+
+    ordinary = module.clip_timing(
+        5.1,
+        clip_padding=0.4,
+        max_clip_seconds=8,
+    )
+    assert ordinary == {
+        "narration_seconds": 5.1,
+        "requested_clip_seconds": 5.5,
+        "clip_seconds": 5.5,
+        "frame_count": 89,
+        "generated_seconds": 5.5625,
+        "capped": False,
+    }
+
+    capped = module.clip_timing(
+        7.9,
+        clip_padding=0.4,
+        max_clip_seconds=8,
+    )
+    assert capped["requested_clip_seconds"] == pytest.approx(8.3)
+    assert capped["clip_seconds"] == 8
+    assert capped["frame_count"] == 125
+    assert capped["generated_seconds"] == 7.8125
+    assert capped["capped"] is True
+
+    assembly = module.assembly_timing(
+        video_seconds=25.33,
+        voiceover_seconds=25.82,
+    )
+    assert assembly["video_pad_seconds"] == pytest.approx(0.49)
+    assert assembly["output_seconds"] == 25.82
+    assert assembly["tail_seconds"] == 0.5
 
 
 def test_persisted_approval_is_available_after_restart(tmp_path: Path) -> None:
@@ -427,7 +553,7 @@ def test_queue_media_stages_use_required_job_types_and_roles(
         pipeline.close()
 
     assert [job["job_type"] for job in queue.submissions] == [
-        "tts",
+        *(["tts"] * 5),
         "transcribe",
         "assemble",
     ]
@@ -437,8 +563,8 @@ def test_queue_media_stages_use_required_job_types_and_roles(
     assert queue.submissions[0]["payload"]["voice_ref_text"] == (
         module.MONOREPO_ROOT / "assets" / "alireza.txt"
     ).read_text(encoding="utf-8").strip()
-    assert set(queue.submissions[1]["input_files"]) == {"audio"}
-    assert set(queue.submissions[2]["input_files"]) == {
+    assert set(queue.submissions[5]["input_files"]) == {"audio"}
+    assert set(queue.submissions[6]["input_files"]) == {
         "clip_1",
         "clip_2",
         "clip_3",
@@ -447,13 +573,143 @@ def test_queue_media_stages_use_required_job_types_and_roles(
         "voiceover",
         "captions",
     }
-    assert queue.submissions[2]["payload"]["input_fps"] == 16
-    assert queue.submissions[2]["payload"]["fps_out"] == 30
-    assert (
-        queue.submissions[2]["payload"]["pre_caption_video_filter"]
-        == "minterpolate=fps=30"
-    )
+    assembly = queue.submissions[6]["payload"]
+    assert assembly["input_fps"] == 16
+    assert assembly["fps_out"] == 30
+    assert assembly["pre_caption_video_filter"] == "minterpolate=fps=30"
+    assert assembly["trim_audio"] is False
+    assert assembly["shortest"] is False
+    assert assembly["tail_room_seconds"] == 0.5
     assert store.get_run(run["id"])["status"] == "assembled"
+
+
+def test_per_shot_tts_state_resumes_without_requeue(tmp_path: Path) -> None:
+    config = settings(tmp_path)
+    store = module.StateStore(config.database_path)
+    run = store.create_run("test")
+    shots = [{"voiceover_text": f"Voice {index}"} for index in range(1, 6)]
+    run = store.update_run(
+        run["id"],
+        status="scripted",
+        script_json=json.dumps({"shots": shots}),
+    )
+    queue = RecordingQueue()
+    pipeline = module.NewsPipeline(config, store, run, queue_client=queue)
+    try:
+        pipeline.generate_voiceover_and_captions()
+        first_submission_count = len(queue.submissions)
+        pipeline.generate_voiceover_and_captions()
+    finally:
+        pipeline.close()
+
+    assert first_submission_count == 6
+    assert len(queue.submissions) == first_submission_count
+    saved = store.get_run(run["id"])
+    state = json.loads(saved["shot_audio_json"])
+    assert sorted(state["shots"]) == ["1", "2", "3", "4", "5"]
+    assert all(
+        Path(entry["path"]).is_file() and entry["duration_seconds"] == 6
+        for entry in state["shots"].values()
+    )
+    assert module.wav_duration_seconds(Path(saved["voiceover_path"])) == 30.5
+
+
+def test_long_narration_gets_one_shortening_retry_and_persists_it(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    config = settings(tmp_path)
+    store = module.StateStore(config.database_path)
+    run = store.create_run("test")
+    shots = [{"voiceover_text": f"Voice {index}"} for index in range(1, 6)]
+    run = store.update_run(
+        run["id"],
+        status="scripted",
+        script_json=json.dumps({"shots": shots}),
+    )
+    queue = RecordingQueue(tts_durations=[9, 9, 5, 5, 5, 5])
+    pipeline = module.NewsPipeline(config, store, run, queue_client=queue)
+    pipeline._rewrite_long_narration = lambda **_: "Shortened voice"
+    try:
+        pipeline.generate_voiceover_and_captions()
+    finally:
+        pipeline.close()
+
+    saved = store.get_run(run["id"])
+    state = json.loads(saved["shot_audio_json"])
+    first = state["shots"]["1"]
+    assert [job["job_type"] for job in queue.submissions].count("tts") == 6
+    assert first["shorten_retry_used"] is True
+    assert first["tts_attempts"] == 2
+    assert first["original_duration_seconds"] == 9
+    assert first["duration_seconds"] == 9
+    assert first["timing"]["capped"] is True
+    assert first["timing"]["frame_count"] == 125
+    assert json.loads(saved["script_json"])["shots"][0]["voiceover_text"] == (
+        "Shortened voice"
+    )
+    assert "above max_clip_seconds" in caplog.text
+    assert "retry is still 9.00s" in caplog.text
+
+
+def test_assembly_tpad_holds_last_frame_and_never_trims_audio(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = settings(tmp_path)
+    store = module.StateStore(config.database_path)
+    run = store.create_run("test")
+    run_dir = config.work_root / run["id"]
+    clip = run_dir / "clips" / "shot_01.mp4"
+    clip.parent.mkdir(parents=True, exist_ok=True)
+    clip.write_bytes(b"clip")
+    voiceover = run_dir / "voiceover.wav"
+    write_wav(voiceover, 10.5)
+    captions = run_dir / "captions.srt"
+    captions.write_text("captions")
+    timing = module.clip_timing(
+        10,
+        clip_padding=0.4,
+        max_clip_seconds=8,
+    )
+    run = store.update_run(
+        run["id"],
+        status="rendered",
+        script_json=json.dumps({"shots": [{"voiceover_text": "Long voice"}]}),
+        clips_json=json.dumps([str(clip)]),
+        voiceover_path=str(voiceover),
+        captions_path=str(captions),
+        shot_audio_json=json.dumps(
+            {
+                "version": 1,
+                "shots": {
+                    "1": {
+                        "path": str(voiceover),
+                        "duration_seconds": 10,
+                        "timing": timing,
+                    }
+                },
+            }
+        ),
+    )
+    monkeypatch.setattr(module, "media_duration_seconds", lambda _: 5.0)
+    queue = RecordingQueue()
+    pipeline = module.NewsPipeline(config, store, run, queue_client=queue)
+    try:
+        pipeline.assemble()
+    finally:
+        pipeline.close()
+
+    payload = queue.submissions[0]["payload"]
+    assert payload["pre_caption_video_filter"] == (
+        "minterpolate=fps=30,"
+        "tpad=stop_mode=clone:stop_duration=5.500000"
+    )
+    assert payload["video_pad_seconds"] == 5.5
+    assert payload["output_duration_seconds"] == 10.5
+    assert payload["tail_room_seconds"] == 0.5
+    assert payload["trim_audio"] is False
+    assert payload["shortest"] is False
 
 
 def test_default_preset_loads_and_cli_defaults_local() -> None:
@@ -463,6 +719,9 @@ def test_default_preset_loads_and_cli_defaults_local() -> None:
     assert preset.script_provider.base_url == "http://100.103.129.82:11434/v1"
     assert preset.script_provider.model == "qwen3.6:35b-a3b"
     assert preset.script_provider.api_key_env is None
+    assert preset.target_duration_seconds == 45
+    assert preset.clip_padding == 0.4
+    assert preset.max_clip_seconds == 8
     assert preset.frame_model == "flux2_klein"
     assert preset.video_mode == "i2v"
     assert preset.fps_out == 30
@@ -625,21 +884,28 @@ def test_local_visuals_enqueue_frame_and_video_jobs(tmp_path: Path) -> None:
         queue_client=queue,
     )
     try:
+        pipeline.generate_voiceover_and_captions()
         pipeline.generate_first_frames()
         pipeline.generate_clips()
     finally:
         pipeline.close()
 
     assert [job["job_type"] for job in queue.submissions] == [
+        *(["tts"] * 5),
+        "transcribe",
         *(["frame"] * 5),
         *(["video"] * 5),
     ]
-    frame_job = queue.submissions[0]
+    frame_job = queue.submissions[6]
     assert frame_job["payload"]["workflow"] == "flux2_klein"
     assert frame_job["payload"]["steps"] == 4
     assert isinstance(frame_job["payload"]["seed"], int)
     assert frame_job["payload"]["prompt"].startswith(module.DEFAULT_STYLE_BLOCK)
-    assert all(set(job["input_files"]) == {"frame"} for job in queue.submissions[5:])
+    video_jobs = queue.submissions[11:]
+    assert all(set(job["input_files"]) == {"frame"} for job in video_jobs)
+    assert all(job["payload"]["fps"] == 16 for job in video_jobs)
+    assert all(job["payload"]["frame_count"] == 105 for job in video_jobs)
+    assert all(job["payload"]["duration_seconds"] == 6.4 for job in video_jobs)
 
 
 def test_flf_uses_two_approved_frames_per_video(tmp_path: Path) -> None:
@@ -674,6 +940,7 @@ def test_flf_uses_two_approved_frames_per_video(tmp_path: Path) -> None:
         queue_client=queue,
     )
     try:
+        pipeline.generate_voiceover_and_captions()
         pipeline.generate_first_frames()
         with pytest.raises(RuntimeError, match="until every frame is approved"):
             pipeline.generate_clips()
@@ -685,10 +952,10 @@ def test_flf_uses_two_approved_frames_per_video(tmp_path: Path) -> None:
     finally:
         pipeline.close()
 
-    assert [job["job_type"] for job in queue.submissions[:10]] == ["frame"] * 10
+    assert [job["job_type"] for job in queue.submissions[6:16]] == ["frame"] * 10
     assert all(
         set(job["input_files"]) == {"first_frame", "last_frame"}
-        for job in queue.submissions[10:]
+        for job in queue.submissions[16:]
     )
 
 
@@ -831,6 +1098,7 @@ def test_frame_album_and_controls_are_not_resent_after_restart(
 
 def test_script_normalizes_motion_mode_and_verbatim_style(tmp_path: Path) -> None:
     style = "ARCHIVAL COLLAGE — "
+    shot_count = module.target_shot_count(45)
     response_script = {
         "title": "Title",
         "description": "Description",
@@ -842,7 +1110,7 @@ def test_script_normalizes_motion_mode_and_verbatim_style(tmp_path: Path) -> Non
                 "first_frame_prompt": f"Subject {index}",
                 "last_frame_prompt": None,
             }
-            for index in range(1, 6)
+            for index in range(1, shot_count + 1)
         ],
     }
     request_payload = {}
@@ -882,7 +1150,11 @@ def test_script_normalizes_motion_mode_and_verbatim_style(tmp_path: Path) -> Non
     script = json.loads(store.get_run(run["id"])["script_json"])
     assert all(shot["first_frame_prompt"].startswith(style) for shot in script["shots"])
     assert all(shot["motion_instruction"] == "slow push-in" for shot in script["shots"])
-    assert "Exactly one short camera move" in request_payload["messages"][1]["content"]
+    prompt = request_payload["messages"][1]["content"]
+    assert f"Exactly {shot_count} shots" in prompt
+    assert "4-6 second range" in prompt
+    assert "about 45 seconds" in prompt
+    assert "Exactly one short camera move" in prompt
 
 
 def test_run_configuration_is_snapshotted_for_resume(tmp_path: Path) -> None:

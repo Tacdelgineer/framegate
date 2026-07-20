@@ -8,6 +8,25 @@ headless ComfyUI API bound only to `127.0.0.1:8188`.
 
 The default client supports:
 
+| Job type | Inputs | Result |
+| --- | --- | --- |
+| `tts` | one shot's `text`, `shot_index`, and target duration in the JSON payload | PCM WAV audio |
+| `transcribe` | `audio` | SRT captions |
+| `assemble` | `clip_1`…`clip_N`, `voiceover`, `captions` | final MP4 |
+
+Local `video` handlers must honor the payload's `frame_count` and `fps`
+(currently Wan `4n+1` frames at 16fps); `duration_seconds` is descriptive and
+useful for backends that accept seconds directly.
+
+For `assemble`, concatenate the dynamic `clip_roles` in order and apply
+`pre_caption_video_filter` to that concatenated stream. The filter contains
+`tpad=stop_mode=clone` whenever video would otherwise end before the
+voiceover. Map the complete voiceover, do not use ffmpeg `-shortest`, and do
+not apply `-t` or `atrim` in a way that cuts it. The voiceover already includes
+0.5 seconds of silent tail room, so `output_duration_seconds` includes the
+required gap between the last spoken word and the end of the final MP4.
+Treat `trim_audio: false` and `shortest: false` as mandatory invariants.
+
 - `GET /jobs?status=pending` followed by atomic
   `POST /jobs/{id}/claim` with `worker_id`.
 - One-use `claim_token` propagation through the entire job.

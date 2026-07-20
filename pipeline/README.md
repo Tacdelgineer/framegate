@@ -1,7 +1,7 @@
 # News pipeline
 
-Crash-resumable, SQLite-backed production of a five-shot, 50-second vertical
-evergreen explainer video.
+Crash-resumable, SQLite-backed production of narration-timed vertical
+evergreen explainer videos. The default preset targets 45 seconds.
 
 ## Run
 
@@ -42,9 +42,19 @@ The frame gate is enabled by default. `--no-frame-gate` skips it.
 
 Every new run reads `../config/presets.yaml` and snapshots the resolved values
 in SQLite so a later edit cannot change a resumed run. The human-editable
-preset controls the verbatim frame-prompt `style_block`, local frame workflow,
-I2V/first-last-frame selection, resolution, draft/final steps, negative prompt,
-output FPS, and the independent OpenAI-compatible `script_provider`.
+preset controls `target_duration_seconds`, `clip_padding`,
+`max_clip_seconds`, the verbatim frame-prompt `style_block`, local frame
+workflow, I2V/first-last-frame selection, resolution, draft/final steps,
+negative prompt, output FPS, and the independent OpenAI-compatible
+`script_provider`.
+
+The script prompt requests enough 4–6-second narration shots to fill
+`target_duration_seconds` (nine shots at the 45-second default). TTS runs once
+per shot before frame/video generation. Each clip requests the measured
+narration duration plus `clip_padding`, rounded up to Wan's `4n+1` frame shape
+at 16fps without exceeding `max_clip_seconds`. Narration over the cap gets one
+script-provider shortening retry; if it is still long, assembly holds the last
+video frame instead of cutting the audio.
 
 `script_provider` contains `base_url`, `model`, and optional `api_key_env`.
 Use `https://api.x.ai/v1` with `XAI_API_KEY` for xAI, or
@@ -56,14 +66,14 @@ not select or alter the script provider.
 
 The successful-stage states are:
 
-`fetched → scripted → framed (frame gate) → rendered → voiced → assembled →
+`fetched → scripted → voiced → framed (frame gate) → rendered → assembled →
 pending_approval → published|rejected`
 
 A newly-created row has a null state until `fetch_story` turns its topic into
 an evergreen content brief. SQLite is in WAL mode. State advances only after a
-complete stage, generated files use atomic replacement, Imagine request IDs
-and queue job IDs are persisted before polling, and a restart resumes the
-newest unfinished run.
+complete stage, generated files use atomic replacement, Imagine request IDs,
+queue job IDs, and each shot's TTS path/duration/timing are persisted before
+the next shot, and a restart resumes the newest unfinished run.
 
 Each stage retries at most three times with exponential backoff. Frame
 approval, generation number, seed, album/control message IDs, and callbacks are
@@ -75,16 +85,21 @@ only that frame. Final-video Regenerate deletes generated media, rewinds to
 
 - `frame`: no input files; payload contains the configured worker workflow,
   prompt, negative prompt, resolution, draft steps, and seed.
+- `tts`: one job per shot; payload contains that shot's narration, shot index,
+  target duration, and the selected `TTS_VOICE_PRESET` contract fields
+  `voice_ref` and `voice_ref_text`. Each result is stored under `voiceover/`
+  and all active results are joined into `voiceover.wav` with 0.5 seconds of
+  silent tail room.
 - `video`: input role `frame` for I2V, or `first_frame` and `last_frame` for
   first/last-frame mode; payload contains the motion instruction, resolution,
-  final steps, and seed.
-- `tts`: payload contains the combined narration and five timed shot entries;
-  result is downloaded to `voiceover.wav`. The selected `TTS_VOICE_PRESET`
-  adds the worker contract fields `voice_ref` and `voice_ref_text`.
+  final steps, seed, narration-derived `duration_seconds`, `frame_count`, and
+  16fps input rate.
 - `transcribe`: input role `audio`, result downloaded to `captions.srt`.
-- `assemble`: input roles `clip_1` through `clip_5`, `voiceover`, and
+- `assemble`: dynamic input roles `clip_1` through `clip_N`, `voiceover`, and
   `captions`; 16fps clips pass through ffmpeg `minterpolate` to the configured
-  `fps_out` before caption burn, and the result is downloaded to `final.mp4`.
+  `fps_out`. If audio is longer, `tpad=stop_mode=clone` extends the final frame
+  through the complete voiceover (including its 0.5-second tail). The payload
+  explicitly forbids trimming audio or using shortest-stream termination.
 
 Content-brief and script generation call the preset's OpenAI-compatible
 provider directly from the VPS. In local visual mode all five job types above

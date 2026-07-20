@@ -37,12 +37,12 @@ again. Claim tokens prevent an expired worker from completing a re-claimed job.
 ```mermaid
 flowchart LR
     subgraph VPS["VPS mini · 100.123.208.90"]
-        P["news_pipeline.py<br/>fetched → scripted → framed → rendered"]
+        P["news_pipeline.py<br/>fetched → scripted → voiced → framed → rendered"]
         X["Optional hosted script API<br/>xAI or OpenAI"]
         V["xAI API<br/>cloud video"]
         O["OpenAI Images API<br/>cloud frames"]
         Q["FastAPI queue :8787<br/>SQLite + files"]
-        A["voiced → assembled<br/>pending_approval"]
+        A["narration-timed clips → assembled<br/>pending_approval"]
         T["Telegram gates<br/>per-frame + final approval"]
         U["publish() stub<br/>published / rejected"]
     end
@@ -75,14 +75,14 @@ to xAI instead. Pipeline state and both approval gates remain on the VPS.
 | Stage | Machine | Provider/model | Notes |
 | --- | --- | --- | --- |
 | Evergreen content brief | DGX via VPS | Ollama `qwen3.6:35b-a3b` | Default keyless OpenAI-compatible chat completions |
-| Five-shot script | DGX via VPS | Ollama `qwen3.6:35b-a3b` | Structured 50-second explainer; hosted provider optional |
+| Narration-timed script | DGX via VPS | Ollama `qwen3.6:35b-a3b` | Enough 4–6-second shots for the preset target duration; hosted provider optional |
 | Frames (local default) | DGX | preset `flux2_klein` workflow | One I2V frame or first/last pair per shot |
 | Frames (cloud) | VPS | OpenAI `gpt-image-1` | 9:16 images |
-| Video clips (local default) | DGX | worker-configured workflow | I2V or first/last-frame, 10 seconds, 9:16 |
-| Video clips (cloud) | VPS | xAI `grok-imagine-video` | 10 seconds, 9:16 |
-| Voiceover | DGX | worker-configured, pending sync | Queue type `tts` |
+| Voiceover | DGX | worker-configured, pending sync | One persisted `tts` result per shot, generated before video |
+| Video clips (local default) | DGX | worker-configured workflow | I2V or first/last-frame, narration + padding, Wan `4n+1` frames at 16fps |
+| Video clips (cloud) | VPS | xAI `grok-imagine-video` | Narration-derived duration, capped by the preset |
 | Captions | DGX | worker-configured, pending sync | Queue type `transcribe` |
-| Assembly | DGX | ffmpeg | `minterpolate` from 16fps to preset `fps_out`, then caption burn |
+| Assembly | DGX | ffmpeg | `minterpolate`, caption burn, and final-frame `tpad` when video is shorter; audio is never trimmed |
 
 The script provider and local visual/assembly settings come from
 `config/presets.yaml` and are snapshotted per run. Hosted script providers use

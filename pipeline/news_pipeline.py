@@ -9,16 +9,20 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import json
 import logging
+import math
 import mimetypes
 import os
 import re
 import secrets
 import sqlite3
+import subprocess
 import sys
 import time
 import uuid
+import wave
 from contextlib import ExitStack
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -48,9 +52,9 @@ LOG = logging.getLogger("news_pipeline")
 STATUSES = (
     "fetched",
     "scripted",
+    "voiced",
     "framed",
     "rendered",
-    "voiced",
     "assembled",
     "pending_approval",
     "published",
@@ -58,7 +62,13 @@ STATUSES = (
 )
 STATUS_INDEX = {status: index for index, status in enumerate(STATUSES)}
 TERMINAL_STATUSES = {"published", "rejected"}
-SHOT_COUNT = 5
+WAN_FPS = 16
+WAN_FRAME_STRIDE = 4
+WAN_FRAME_OFFSET = 1
+NARRATION_SECONDS_MIN = 4.0
+NARRATION_SECONDS_MAX = 6.0
+ASSEMBLY_TAIL_SECONDS = 0.5
+TELEGRAM_MEDIA_GROUP_LIMIT = 10
 
 XAI_VIDEO_CREATE_URL = "https://api.x.ai/v1/videos/generations"
 XAI_VIDEO_STATUS_URL = "https://api.x.ai/v1/videos/{request_id}"
@@ -142,6 +152,173 @@ def atomic_write_bytes(path: Path, content: bytes) -> None:
         partial.unlink(missing_ok=True)
 
 
+def target_shot_count(target_duration_seconds: float) -> int:
+    """Aim for roughly five seconds of narration per shot."""
+    return max(1, math.ceil(target_duration_seconds / 5.0))
+
+
+def wan_frame_count(
+    clip_seconds: float,
+    *,
+    fps: int = WAN_FPS,
+    max_clip_seconds: float | None = None,
+) -> int:
+    """Round up to Wan's 4n+1 frame shape without crossing a hard cap."""
+    if clip_seconds <= 0:
+        raise ValueError("clip_seconds must be positive")
+    if fps <= 0:
+        raise ValueError("fps must be positive")
+    requested_frames = math.ceil(clip_seconds * fps)
+    frame_count = (
+        math.ceil((requested_frames - WAN_FRAME_OFFSET) / WAN_FRAME_STRIDE)
+        * WAN_FRAME_STRIDE
+        + WAN_FRAME_OFFSET
+    )
+    frame_count = max(WAN_FRAME_OFFSET, frame_count)
+    if max_clip_seconds is None:
+        return frame_count
+    if max_clip_seconds <= 0:
+        raise ValueError("max_clip_seconds must be positive")
+    max_frames = math.floor(max_clip_seconds * fps)
+    max_compatible = (
+        math.floor((max_frames - WAN_FRAME_OFFSET) / WAN_FRAME_STRIDE)
+        * WAN_FRAME_STRIDE
+        + WAN_FRAME_OFFSET
+    )
+    return min(frame_count, max(WAN_FRAME_OFFSET, max_compatible))
+
+
+def clip_timing(
+    narration_seconds: float,
+    *,
+    clip_padding: float,
+    max_clip_seconds: float,
+    fps: int = WAN_FPS,
+) -> dict[str, float | int | bool]:
+    if narration_seconds <= 0:
+        raise ValueError("narration_seconds must be positive")
+    requested_seconds = narration_seconds + clip_padding
+    capped_seconds = min(requested_seconds, max_clip_seconds)
+    frames = wan_frame_count(
+        capped_seconds,
+        fps=fps,
+        max_clip_seconds=max_clip_seconds,
+    )
+    return {
+        "narration_seconds": narration_seconds,
+        "requested_clip_seconds": requested_seconds,
+        "clip_seconds": capped_seconds,
+        "frame_count": frames,
+        "generated_seconds": frames / fps,
+        "capped": requested_seconds > max_clip_seconds,
+    }
+
+
+def wav_duration_seconds(path: Path) -> float:
+    try:
+        with wave.open(str(path), "rb") as source:
+            frame_rate = source.getframerate()
+            if frame_rate <= 0:
+                raise ValueError(f"WAV has invalid frame rate: {path}")
+            return source.getnframes() / frame_rate
+    except (wave.Error, EOFError) as exc:
+        raise ValueError(f"Could not measure WAV duration: {path}") from exc
+
+
+def concatenate_wavs(
+    sources: list[Path],
+    destination: Path,
+    *,
+    tail_seconds: float = ASSEMBLY_TAIL_SECONDS,
+) -> None:
+    if not sources:
+        raise ValueError("Cannot concatenate an empty WAV list")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    partial = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.part")
+    try:
+        with ExitStack() as stack:
+            readers = [
+                stack.enter_context(wave.open(str(source), "rb")) for source in sources
+            ]
+            expected = (
+                readers[0].getnchannels(),
+                readers[0].getsampwidth(),
+                readers[0].getframerate(),
+                readers[0].getcomptype(),
+            )
+            if expected[3] != "NONE":
+                raise ValueError("Per-shot narration WAV must be uncompressed PCM")
+            for source, reader in zip(sources[1:], readers[1:], strict=True):
+                actual = (
+                    reader.getnchannels(),
+                    reader.getsampwidth(),
+                    reader.getframerate(),
+                    reader.getcomptype(),
+                )
+                if actual != expected:
+                    raise ValueError(
+                        f"Per-shot narration WAV format mismatch: {source}"
+                    )
+            output = stack.enter_context(wave.open(str(partial), "wb"))
+            output.setnchannels(expected[0])
+            output.setsampwidth(expected[1])
+            output.setframerate(expected[2])
+            for reader in readers:
+                output.writeframes(reader.readframes(reader.getnframes()))
+            tail_frames = round(tail_seconds * expected[2])
+            output.writeframes(
+                b"\0" * tail_frames * expected[0] * expected[1]
+            )
+        os.replace(partial, destination)
+    finally:
+        partial.unlink(missing_ok=True)
+
+
+def media_duration_seconds(path: Path) -> float:
+    if path.suffix.lower() == ".wav":
+        return wav_duration_seconds(path)
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(path),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        duration = float(result.stdout.strip())
+    except (FileNotFoundError, subprocess.CalledProcessError, ValueError) as exc:
+        raise ValueError(f"Could not measure media duration: {path}") from exc
+    if duration <= 0:
+        raise ValueError(f"Media duration must be positive: {path}")
+    return duration
+
+
+def assembly_timing(
+    *,
+    video_seconds: float,
+    voiceover_seconds: float,
+    tail_seconds: float = ASSEMBLY_TAIL_SECONDS,
+) -> dict[str, float]:
+    if video_seconds <= 0 or voiceover_seconds <= 0:
+        raise ValueError("Assembly durations must be positive")
+    output_seconds = max(video_seconds, voiceover_seconds)
+    return {
+        "video_seconds": video_seconds,
+        "voiceover_seconds": voiceover_seconds,
+        "tail_seconds": tail_seconds,
+        "video_pad_seconds": max(0.0, voiceover_seconds - video_seconds),
+        "output_seconds": output_seconds,
+    }
+
+
 @dataclass(frozen=True)
 class ScriptProviderConfig:
     base_url: str = DEFAULT_SCRIPT_BASE_URL
@@ -188,6 +365,9 @@ class ScriptProviderConfig:
 @dataclass(frozen=True)
 class PipelineConfig:
     script_provider: ScriptProviderConfig = field(default_factory=ScriptProviderConfig)
+    target_duration_seconds: float = 45.0
+    clip_padding: float = 0.4
+    max_clip_seconds: float = 8.0
     style_block: str = DEFAULT_STYLE_BLOCK
     frame_model: str = "flux2_klein"
     video_mode: str = "i2v"
@@ -211,6 +391,9 @@ class PipelineConfig:
             raise ValueError("script_provider must be a YAML mapping")
         config = cls(
             script_provider=ScriptProviderConfig.from_mapping(raw_script_provider),
+            target_duration_seconds=merged["target_duration_seconds"],
+            clip_padding=merged["clip_padding"],
+            max_clip_seconds=merged["max_clip_seconds"],
             style_block=merged["style_block"],
             frame_model=merged["frame_model"],
             video_mode=merged["video_mode"],
@@ -246,6 +429,22 @@ class PipelineConfig:
             raise ValueError(
                 "video_mode must be one of: " + ", ".join(sorted(VIDEO_MODES))
             )
+        for name in (
+            "target_duration_seconds",
+            "clip_padding",
+            "max_clip_seconds",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(f"{name} must be a number")
+        if self.target_duration_seconds <= 0:
+            raise ValueError("target_duration_seconds must be positive")
+        if self.clip_padding < 0:
+            raise ValueError("clip_padding must be non-negative")
+        if self.max_clip_seconds <= 0:
+            raise ValueError("max_clip_seconds must be positive")
+        if self.clip_padding >= self.max_clip_seconds:
+            raise ValueError("clip_padding must be less than max_clip_seconds")
         for name in ("steps_draft", "steps_final", "fps_out"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
@@ -254,6 +453,9 @@ class PipelineConfig:
     def to_dict(self) -> dict[str, Any]:
         return {
             "script_provider": self.script_provider.to_dict(),
+            "target_duration_seconds": self.target_duration_seconds,
+            "clip_padding": self.clip_padding,
+            "max_clip_seconds": self.max_clip_seconds,
             "style_block": self.style_block,
             "frame_model": self.frame_model,
             "video_mode": self.video_mode,
@@ -386,6 +588,7 @@ RUN_COLUMNS = {
     "clips_json",
     "video_requests_json",
     "queue_jobs_json",
+    "shot_audio_json",
     "voiceover_path",
     "captions_path",
     "final_path",
@@ -451,6 +654,7 @@ class StateStore:
                     clips_json TEXT,
                     video_requests_json TEXT,
                     queue_jobs_json TEXT,
+                    shot_audio_json TEXT,
                     voiceover_path TEXT,
                     captions_path TEXT,
                     final_path TEXT,
@@ -525,6 +729,10 @@ class StateStore:
                 connection.execute("ALTER TABLE runs ADD COLUMN frame_gate_json TEXT")
             if "run_config_json" not in columns:
                 connection.execute("ALTER TABLE runs ADD COLUMN run_config_json TEXT")
+            if "shot_audio_json" not in columns:
+                connection.execute(
+                    "ALTER TABLE runs ADD COLUMN shot_audio_json TEXT"
+                )
 
     def create_run(self, topic: str) -> dict[str, Any]:
         run_id = str(uuid.uuid4())
@@ -535,8 +743,8 @@ class StateStore:
                 INSERT INTO runs(
                     id, topic, status, created_at, updated_at,
                     frames_json, frame_gate_json, clips_json,
-                    video_requests_json, queue_jobs_json
-                ) VALUES (?, ?, NULL, ?, ?, '[]', '{}', '[]', '{}', '{}')
+                    video_requests_json, queue_jobs_json, shot_audio_json
+                ) VALUES (?, ?, NULL, ?, ?, '[]', '{}', '[]', '{}', '{}', '{}')
                 """,
                 (run_id, topic, now, now),
             )
@@ -867,6 +1075,7 @@ class NewsPipeline:
 
     def fetch_story(self) -> None:
         topic = self.current()["topic"]
+        target_seconds = self.config.target_duration_seconds
         system_prompt = (
             "You are an expert explainer producer. Develop an original, "
             "evergreen content brief from the supplied topic itself. Do not "
@@ -874,8 +1083,8 @@ class NewsPipeline:
             "quotes, statistics, or current events. Return only valid JSON."
         )
         user_prompt = f"""
-Create a focused brief for a 50-second vertical explainer about this exact
-topic:
+Create a focused brief for a roughly {target_seconds:g}-second vertical
+explainer about this exact topic:
 
 {topic}
 
@@ -942,6 +1151,9 @@ visually without on-screen text.
                 "otherwise use i2v. Provide last_frame_prompt only for flf."
             ),
         }[self.config.video_mode]
+        target_seconds = self.config.target_duration_seconds
+        shot_count = target_shot_count(target_seconds)
+        average_seconds = target_seconds / shot_count
         system_prompt = (
             "You write original, accurate, fast-paced evergreen explainer "
             "scripts for vertical video. Return only valid JSON. Stay within "
@@ -950,8 +1162,9 @@ visually without on-screen text.
             "simple camera move as its motion instruction."
         )
         user_prompt = f"""
-Turn this topic brief into an original 50-second evergreen YouTube explainer
-split into exactly five 10-second shots.
+Turn this topic brief into an original evergreen YouTube explainer targeting
+about {target_seconds:g} seconds, split into exactly {shot_count}
+narration-driven shots.
 
 TOPIC BRIEF:
 {json.dumps(story, ensure_ascii=False)}
@@ -965,7 +1178,7 @@ Return exactly:
   "description": "Two short paragraphs describing the explainer",
   "shots": [
     {{
-      "voiceover_text": "spoken narration for this 10-second shot",
+      "voiceover_text": "spoken narration for this roughly 4-6 second shot",
       "motion_instruction": "one camera move, for example: slow push-in",
       "video_mode": "i2v or flf",
       "first_frame_prompt": "STYLE BLOCK followed by a detailed 9:16 opening frame prompt",
@@ -975,10 +1188,12 @@ Return exactly:
 }}
 
 Requirements:
-- Exactly five shots.
-- Total voiceover should sound natural in about 50 seconds.
-- Shot 1 hooks immediately; shots 2-4 build the explanation; shot 5 lands the
-  central insight and why it matters.
+- Exactly {shot_count} shots.
+- Aim for about {average_seconds:.1f} seconds of spoken narration per shot,
+  keeping every shot in the 4-6 second range.
+- Total voiceover should sound natural in about {target_seconds:g} seconds.
+- Shot 1 hooks immediately; the middle shots build the explanation; the final
+  shot lands the central insight and why it matters.
 - Exactly one short camera move per motion_instruction (for example "slow
   push-in", "gentle pan left", or "static locked-off"); do not combine moves.
 - {mode_instruction}
@@ -994,8 +1209,8 @@ Requirements:
         if not isinstance(script, dict):
             raise ValueError("write_script must return a JSON object")
         shots = script.get("shots")
-        if not isinstance(shots, list) or len(shots) != SHOT_COUNT:
-            raise ValueError(f"Script must contain exactly {SHOT_COUNT} shots")
+        if not isinstance(shots, list) or len(shots) != shot_count:
+            raise ValueError(f"Script must contain exactly {shot_count} shots")
         for index, shot in enumerate(shots, start=1):
             if not isinstance(shot, dict):
                 raise ValueError(f"Shot {index} must be an object")
@@ -1062,8 +1277,8 @@ Requirements:
 
     def _frame_specs(self, script: Mapping[str, Any]) -> list[dict[str, Any]]:
         shots = script.get("shots", [])
-        if not isinstance(shots, list) or len(shots) != SHOT_COUNT:
-            raise ValueError("Cannot resolve frames without five scripted shots")
+        if not isinstance(shots, list) or not shots:
+            raise ValueError("Cannot resolve frames without scripted shots")
         specs: list[dict[str, Any]] = []
         for shot_index, shot in enumerate(shots, start=1):
             if not isinstance(shot, Mapping):
@@ -1265,6 +1480,7 @@ Requirements:
         self,
         first_frame: Path,
         prompt: str,
+        duration_seconds: float,
         last_frame: Path | None = None,
     ) -> str:
         api_key = self.require_key("XAI_API_KEY", self.settings.xai_api_key)
@@ -1272,7 +1488,7 @@ Requirements:
             "model": self.settings.video_model,
             "prompt": prompt,
             "image": {"url": self._image_data_uri(first_frame)},
-            "duration": 10,
+            "duration": math.ceil(duration_seconds),
             "aspect_ratio": "9:16",
             "resolution": self.config.video_resolution,
         }
@@ -1336,9 +1552,47 @@ Requirements:
         finally:
             partial.unlink(missing_ok=True)
 
+    def _shot_audio_state(self) -> dict[str, Any]:
+        state = json_load(self.current().get("shot_audio_json"), {})
+        if not isinstance(state, Mapping):
+            return {"version": 1, "shots": {}}
+        shots = state.get("shots")
+        return {
+            **dict(state),
+            "version": 1,
+            "shots": dict(shots) if isinstance(shots, Mapping) else {},
+        }
+
+    def _persist_shot_audio_state(
+        self,
+        state: Mapping[str, Any],
+        **run_values: Any,
+    ) -> None:
+        self.store.update_run(
+            self.run_id,
+            shot_audio_json=json.dumps(dict(state)),
+            last_error=None,
+            **run_values,
+        )
+
+    def _shot_timing(self, state: Mapping[str, Any], index: int) -> dict[str, Any]:
+        shots = state.get("shots")
+        entry = shots.get(str(index)) if isinstance(shots, Mapping) else None
+        timing = entry.get("timing") if isinstance(entry, Mapping) else None
+        if not isinstance(timing, Mapping):
+            raise ValueError(
+                f"Shot {index} has no persisted narration timing; "
+                "voice the script before generating video"
+            )
+        return dict(timing)
+
     def generate_clips(self) -> None:
         row = self.current()
         script = json_load(row["script_json"], {})
+        shots = script.get("shots", [])
+        if not isinstance(shots, list) or not shots:
+            raise ValueError("Cannot generate clips without scripted shots")
+        shot_audio_state = self._shot_audio_state()
         specs = self._frame_specs(script)
         frames = [Path(path) for path in json_load(row["frames_json"], [])]
         if len(frames) != len(specs) or not all(valid_file(path) for path in frames):
@@ -1358,10 +1612,11 @@ Requirements:
             ] = path
         requests: dict[str, str] = json_load(row["video_requests_json"], {})
         clips: list[str] = []
-        for index, shot in enumerate(script["shots"], start=1):
+        for index, shot in enumerate(shots, start=1):
             key = str(index)
             path = self.run_dir / "clips" / f"shot_{index:02d}.mp4"
             if not valid_file(path):
+                timing = self._shot_timing(shot_audio_state, index)
                 mode = self._shot_mode(shot, index)
                 shot_frames = frames_by_shot[index]
                 first_frame = shot_frames["first"]
@@ -1389,8 +1644,9 @@ Requirements:
                             "resolution": self.config.video_resolution,
                             "steps": self.config.steps_final,
                             "seed": new_seed(),
-                            "duration_seconds": 10,
-                            "fps": 16,
+                            "duration_seconds": timing["clip_seconds"],
+                            "frame_count": timing["frame_count"],
+                            "fps": WAN_FPS,
                             "aspect_ratio": "9:16",
                             "output_format": "mp4",
                         },
@@ -1400,10 +1656,11 @@ Requirements:
                 else:
                     request_id = requests.get(key)
                     if not request_id:
-                        LOG.info("Submitting xAI video %s/%s", index, SHOT_COUNT)
+                        LOG.info("Submitting xAI video %s/%s", index, len(shots))
                         request_id = self._start_video(
                             first_frame,
                             motion,
+                            float(timing["clip_seconds"]),
                             last_frame,
                         )
                         requests[key] = request_id
@@ -1417,7 +1674,7 @@ Requirements:
                             requests.pop(key, None)
                             self._persist_video_requests(requests)
                         raise
-                    LOG.info("Downloading xAI video %s/%s", index, SHOT_COUNT)
+                    LOG.info("Downloading xAI video %s/%s", index, len(shots))
                     self._download_file(video_url, path)
             clips.append(str(path))
             self.store.update_run(
@@ -1475,39 +1732,230 @@ Requirements:
             self.store.update_run(self.run_id, queue_jobs_json=json.dumps(jobs))
             raise
 
+    def _rewrite_long_narration(
+        self,
+        *,
+        shot: Mapping[str, Any],
+        index: int,
+        shot_count: int,
+        measured_seconds: float,
+    ) -> str:
+        target_seconds = min(
+            NARRATION_SECONDS_MAX,
+            self.config.max_clip_seconds - self.config.clip_padding,
+        )
+        max_words = max(4, math.floor(target_seconds * 2.3))
+        result, _ = self._script_chat(
+            system_prompt=(
+                "You tighten one spoken narration segment without changing its "
+                "meaning, factual claims, tone, or relationship to the visuals. "
+                "Return only valid JSON."
+            ),
+            user_prompt=f"""
+Shot {index} of {shot_count} measured {measured_seconds:.2f} seconds, exceeding
+the {self.config.max_clip_seconds:g}-second clip cap. Rewrite only its narration
+so it speaks in at most about {target_seconds:.1f} seconds and no more than
+{max_words} words.
+
+Current shot:
+{json.dumps(dict(shot), ensure_ascii=False)}
+
+Return exactly:
+{{"voiceover_text": "shortened spoken narration"}}
+""".strip(),
+        )
+        if not isinstance(result, Mapping):
+            raise ValueError(f"Shot {index} narration retry did not return an object")
+        text = str(result.get("voiceover_text") or "").strip()
+        if not text:
+            raise ValueError(f"Shot {index} narration retry returned empty text")
+        return text
+
     def generate_voiceover_and_captions(self) -> None:
-        script = json_load(self.current()["script_json"], {})
+        row = self.current()
+        script = json_load(row["script_json"], {})
         shots = script.get("shots", [])
-        if len(shots) != SHOT_COUNT:
-            raise ValueError("Cannot voice a pipeline without five shots")
-        voiceover_path = self.run_dir / "voiceover.wav"
-        captions_path = self.run_dir / "captions.srt"
-        voiceover_text = "\n\n".join(
-            str(shot["voiceover_text"]).strip() for shot in shots
+        if not isinstance(shots, list) or not shots:
+            raise ValueError("Cannot voice a pipeline without scripted shots")
+        state = self._shot_audio_state()
+        entries = state["shots"]
+        desired_seconds = min(
+            NARRATION_SECONDS_MAX,
+            max(
+                NARRATION_SECONDS_MIN,
+                self.config.target_duration_seconds / len(shots),
+            ),
         )
         voice_reference = self._voice_reference_payload()
-        self._queue_job(
-            "tts",
-            "tts",
-            {
-                "text": voiceover_text,
-                "shots": [
+        active_paths: list[Path] = []
+
+        for index, shot in enumerate(shots, start=1):
+            if not isinstance(shot, dict):
+                raise ValueError(f"Shot {index} must be an object")
+            text = str(shot.get("voiceover_text") or "").strip()
+            if not text:
+                raise ValueError(f"Shot {index} is missing voiceover_text")
+            key = str(index)
+            entry = entries.get(key)
+            if not isinstance(entry, Mapping) or entry.get("text") != text:
+                entry = {
+                    "index": index,
+                    "text": text,
+                    "shorten_retry_used": False,
+                    "tts_attempts": 0,
+                }
+            else:
+                entry = dict(entry)
+
+            retry_used = bool(entry.get("shorten_retry_used"))
+            attempt = 2 if retry_used else 1
+            shot_path = (
+                self.run_dir
+                / "voiceover"
+                / f"shot_{index:02d}_attempt_{attempt}.wav"
+            )
+            self._queue_job(
+                f"tts:{index}:attempt:{attempt}",
+                "tts",
+                {
+                    "text": text,
+                    "shot_index": index,
+                    "target_duration_seconds": desired_seconds,
+                    "output_format": "wav",
+                    **voice_reference,
+                },
+                {},
+                shot_path,
+            )
+            duration = wav_duration_seconds(shot_path)
+            entry.update(
+                {
+                    "path": str(shot_path),
+                    "duration_seconds": duration,
+                    "tts_attempts": attempt,
+                }
+            )
+            entries[key] = entry
+            self._persist_shot_audio_state(state)
+
+            if duration > self.config.max_clip_seconds and not retry_used:
+                LOG.warning(
+                    "Shot %s narration is %.2fs, above max_clip_seconds %.2fs; "
+                    "asking the script provider for one shorter retry",
+                    index,
+                    duration,
+                    self.config.max_clip_seconds,
+                )
+                shortened = self._rewrite_long_narration(
+                    shot=shot,
+                    index=index,
+                    shot_count=len(shots),
+                    measured_seconds=duration,
+                )
+                shot["voiceover_text"] = shortened
+                text = shortened
+                entry.update(
                     {
-                        "index": index,
-                        "text": shot["voiceover_text"],
-                        "target_duration_seconds": 10,
+                        "text": text,
+                        "shorten_retry_used": True,
+                        "original_duration_seconds": duration,
+                        "path": None,
+                        "duration_seconds": None,
+                        "tts_attempts": 1,
                     }
-                    for index, shot in enumerate(shots, start=1)
-                ],
-                "target_duration_seconds": 50,
-                "output_format": "wav",
-                **voice_reference,
-            },
-            {},
-            voiceover_path,
+                )
+                entries[key] = entry
+                self.store.update_run(
+                    self.run_id,
+                    script_json=json.dumps(script),
+                    shot_audio_json=json.dumps(state),
+                    last_error=None,
+                )
+
+                attempt = 2
+                shot_path = (
+                    self.run_dir
+                    / "voiceover"
+                    / f"shot_{index:02d}_attempt_{attempt}.wav"
+                )
+                self._queue_job(
+                    f"tts:{index}:attempt:{attempt}",
+                    "tts",
+                    {
+                        "text": text,
+                        "shot_index": index,
+                        "target_duration_seconds": desired_seconds,
+                        "output_format": "wav",
+                        **voice_reference,
+                    },
+                    {},
+                    shot_path,
+                )
+                duration = wav_duration_seconds(shot_path)
+                entry.update(
+                    {
+                        "path": str(shot_path),
+                        "duration_seconds": duration,
+                        "tts_attempts": attempt,
+                    }
+                )
+                entries[key] = entry
+                self._persist_shot_audio_state(state)
+                if duration > self.config.max_clip_seconds:
+                    LOG.warning(
+                        "Shot %s narration retry is still %.2fs; accepting the "
+                        "%.2fs clip cap and relying on assembly final-frame padding",
+                        index,
+                        duration,
+                        self.config.max_clip_seconds,
+                    )
+
+            timing = clip_timing(
+                duration,
+                clip_padding=self.config.clip_padding,
+                max_clip_seconds=self.config.max_clip_seconds,
+            )
+            entry["timing"] = timing
+            entries[key] = entry
+            active_paths.append(shot_path)
+            self._persist_shot_audio_state(state)
+
+        state["shots"] = {
+            str(index): entries[str(index)]
+            for index in range(1, len(shots) + 1)
+        }
+        narration_seconds = sum(
+            float(entry["duration_seconds"]) for entry in state["shots"].values()
         )
+        voiceover_path = self.run_dir / "voiceover.wav"
+        concatenate_wavs(
+            active_paths,
+            voiceover_path,
+            tail_seconds=ASSEMBLY_TAIL_SECONDS,
+        )
+        voiceover_seconds = wav_duration_seconds(voiceover_path)
+        fingerprint = hashlib.sha256(voiceover_path.read_bytes()).hexdigest()
+        state.update(
+            {
+                "narration_duration_seconds": narration_seconds,
+                "voiceover_duration_seconds": voiceover_seconds,
+                "tail_seconds": ASSEMBLY_TAIL_SECONDS,
+                "voiceover_sha256": fingerprint,
+            }
+        )
+        self._persist_shot_audio_state(
+            state,
+            voiceover_path=str(voiceover_path),
+        )
+
+        captions_path = self.run_dir / "captions.srt"
+        if (
+            state.get("captions_for_voiceover_sha256") != fingerprint
+            and captions_path.exists()
+        ):
+            captions_path.unlink()
         self._queue_job(
-            "transcribe",
+            f"transcribe:{fingerprint[:16]}",
             "transcribe",
             {
                 "format": "srt",
@@ -1517,9 +1965,12 @@ Requirements:
             {"audio": voiceover_path},
             captions_path,
         )
+        state["captions_for_voiceover_sha256"] = fingerprint
         self.store.update_run(
             self.run_id,
             status="voiced",
+            script_json=json.dumps(script),
+            shot_audio_json=json.dumps(state),
             voiceover_path=str(voiceover_path),
             captions_path=str(captions_path),
             last_error=None,
@@ -1552,15 +2003,40 @@ Requirements:
     def assemble(self) -> None:
         row = self.current()
         clips = [Path(path) for path in json_load(row["clips_json"], [])]
+        script = json_load(row["script_json"], {})
+        shots = script.get("shots", [])
         voiceover = Path(row["voiceover_path"] or "")
         captions = Path(row["captions_path"] or "")
         if (
-            len(clips) != SHOT_COUNT
+            not isinstance(shots, list)
+            or not shots
+            or len(clips) != len(shots)
             or not all(valid_file(path) for path in clips)
             or not valid_file(voiceover)
             or not valid_file(captions)
         ):
             raise ValueError("Assemble inputs are incomplete")
+        shot_audio_state = self._shot_audio_state()
+        try:
+            video_seconds = sum(media_duration_seconds(path) for path in clips)
+        except ValueError:
+            video_seconds = sum(
+                float(
+                    self._shot_timing(shot_audio_state, index)["generated_seconds"]
+                )
+                for index in range(1, len(shots) + 1)
+            )
+        voiceover_seconds = wav_duration_seconds(voiceover)
+        timing = assembly_timing(
+            video_seconds=video_seconds,
+            voiceover_seconds=voiceover_seconds,
+        )
+        video_filter = f"minterpolate=fps={self.config.fps_out}"
+        if timing["video_pad_seconds"] > 0:
+            video_filter += (
+                ",tpad=stop_mode=clone:"
+                f"stop_duration={timing['video_pad_seconds']:.6f}"
+            )
         final_path = self.run_dir / "final.mp4"
         inputs: dict[str, Path] = {
             f"clip_{index}": path for index, path in enumerate(clips, start=1)
@@ -1571,14 +2047,26 @@ Requirements:
             "assemble",
             "assemble",
             {
-                "clip_roles": [f"clip_{index}" for index in range(1, 6)],
+                "clip_roles": [
+                    f"clip_{index}" for index in range(1, len(clips) + 1)
+                ],
                 "voiceover_role": "voiceover",
                 "captions_role": "captions",
-                "shot_duration_seconds": 10,
+                "clip_timings": [
+                    self._shot_timing(shot_audio_state, index)
+                    for index in range(1, len(shots) + 1)
+                ],
                 "aspect_ratio": "9:16",
-                "input_fps": 16,
+                "input_fps": WAN_FPS,
                 "fps_out": self.config.fps_out,
-                "pre_caption_video_filter": (f"minterpolate=fps={self.config.fps_out}"),
+                "pre_caption_video_filter": video_filter,
+                "video_duration_seconds": timing["video_seconds"],
+                "voiceover_duration_seconds": timing["voiceover_seconds"],
+                "video_pad_seconds": timing["video_pad_seconds"],
+                "output_duration_seconds": timing["output_seconds"],
+                "tail_room_seconds": timing["tail_seconds"],
+                "trim_audio": False,
+                "shortest": False,
                 "burn_captions": True,
                 "output_format": "mp4",
             },
@@ -1673,45 +2161,73 @@ Requirements:
             "TELEGRAM_CHAT_ID or TELEGRAM_DEFAULT_CHAT_ID",
             self.settings.telegram_chat_id,
         )
-        media = []
-        with ExitStack() as stack:
-            files: dict[str, Any] = {}
-            for spec in specs:
-                attachment = f"frame_{spec['index']}"
-                path = Path(spec["path"])
-                handle = stack.enter_context(path.open("rb"))
-                files[attachment] = (path.name, handle, "image/png")
-                item: dict[str, Any] = {
-                    "type": "photo",
-                    "media": f"attach://{attachment}",
-                }
-                if spec["index"] == 1:
-                    item["caption"] = (
-                        f"Frame approval · {self.current()['title'] or 'News Short'}"
-                        f"\nRun: {self.run_id}"
-                    )[:1024]
-                media.append(item)
-            response = self._telegram_api(
-                "sendMediaGroup",
-                data={"chat_id": chat_id, "media": json.dumps(media)},
-                files=files,
-                timeout=max(self.settings.request_timeout, 300),
-            )
-        messages = response.get("result")
-        if not isinstance(messages, list) or len(messages) != len(specs):
-            raise RemoteAPIError(
-                "Telegram sendMediaGroup returned an unexpected message count"
-            )
         state["chat_id"] = str(chat_id)
-        state["album_message_ids"] = [
-            str(message["message_id"]) for message in messages
-        ]
-        state["requested_at"] = utc_now()
-        for frame, message_id in zip(
-            state["frames"], state["album_message_ids"], strict=True
-        ):
-            frame["album_message_id"] = message_id
-        self._save_frame_gate(state)
+        message_ids = list(state.get("album_message_ids") or [])
+        start = len(message_ids)
+        while start < len(specs):
+            remaining = len(specs) - start
+            batch_size = min(TELEGRAM_MEDIA_GROUP_LIMIT, remaining)
+            if remaining - batch_size == 1:
+                batch_size -= 1
+            batch = specs[start : start + batch_size]
+            media = []
+            with ExitStack() as stack:
+                files: dict[str, Any] = {}
+                for spec in batch:
+                    attachment = f"frame_{spec['index']}"
+                    path = Path(spec["path"])
+                    handle = stack.enter_context(path.open("rb"))
+                    files[attachment] = (path.name, handle, "image/png")
+                    item: dict[str, Any] = {
+                        "type": "photo",
+                        "media": f"attach://{attachment}",
+                    }
+                    if spec["index"] == 1:
+                        item["caption"] = (
+                            "Frame approval · "
+                            f"{self.current()['title'] or 'News Short'}"
+                            f"\nRun: {self.run_id}"
+                        )[:1024]
+                    media.append(item)
+                if len(batch) == 1:
+                    item = media[0]
+                    data = {
+                        "chat_id": chat_id,
+                        "photo": item["media"],
+                    }
+                    if item.get("caption"):
+                        data["caption"] = item["caption"]
+                    response = self._telegram_api(
+                        "sendPhoto",
+                        data=data,
+                        files=files,
+                        timeout=max(self.settings.request_timeout, 300),
+                    )
+                    messages = [response.get("result")]
+                else:
+                    response = self._telegram_api(
+                        "sendMediaGroup",
+                        data={"chat_id": chat_id, "media": json.dumps(media)},
+                        files=files,
+                        timeout=max(self.settings.request_timeout, 300),
+                    )
+                    messages = response.get("result")
+            if not isinstance(messages, list) or len(messages) != len(batch):
+                raise RemoteAPIError(
+                    "Telegram frame upload returned an unexpected message count"
+                )
+            batch_ids = [str(message["message_id"]) for message in messages]
+            message_ids.extend(batch_ids)
+            for frame, message_id in zip(
+                state["frames"][start : start + len(batch)],
+                batch_ids,
+                strict=True,
+            ):
+                frame["album_message_id"] = message_id
+            start += len(batch)
+            state["album_message_ids"] = message_ids
+            state["requested_at"] = utc_now()
+            self._save_frame_gate(state)
 
     def _edit_frame_album_item(
         self,
@@ -1737,7 +2253,7 @@ Requirements:
         if not all(valid_file(spec["path"]) for spec in specs):
             raise ValueError("Cannot request approval with missing frames")
         state = self._ensure_frame_gate_state(specs)
-        if not state.get("album_message_ids"):
+        if len(state.get("album_message_ids") or []) < len(specs):
             self._send_frame_album(state, specs)
         for frame in state["frames"]:
             if frame.get("status") == "pending" and not frame.get("control_message_id"):
@@ -2071,9 +2587,25 @@ Requirements:
 
     def reset_for_regeneration(self) -> None:
         row = self.current()
+        shot_audio = json_load(row.get("shot_audio_json"), {})
+        shot_audio_paths = (
+            [
+                entry.get("path")
+                for entry in shot_audio.get("shots", {}).values()
+                if isinstance(entry, Mapping)
+            ]
+            if isinstance(shot_audio, Mapping)
+            and isinstance(shot_audio.get("shots"), Mapping)
+            else []
+        )
+        voiceover_attempts = list(
+            (self.run_dir / "voiceover").glob("shot_*_attempt_*.wav")
+        )
         paths = [
             *json_load(row["frames_json"], []),
             *json_load(row["clips_json"], []),
+            *shot_audio_paths,
+            *voiceover_attempts,
             row["voiceover_path"],
             row["captions_path"],
             row["final_path"],
@@ -2089,6 +2621,7 @@ Requirements:
             clips_json="[]",
             video_requests_json="{}",
             queue_jobs_json="{}",
+            shot_audio_json="{}",
             voiceover_path=None,
             captions_path=None,
             final_path=None,
@@ -2106,6 +2639,51 @@ Requirements:
         frames = json_load(row["frames_json"], [])
         clips = json_load(row["clips_json"], [])
         script = json_load(row["script_json"], {})
+        shots = script.get("shots", []) if isinstance(script, Mapping) else []
+        shot_count = len(shots) if isinstance(shots, list) else 0
+        shot_audio = json_load(row.get("shot_audio_json"), {})
+        shot_entries = (
+            shot_audio.get("shots", {})
+            if isinstance(shot_audio, Mapping)
+            and isinstance(shot_audio.get("shots"), Mapping)
+            else {}
+        )
+        narration_complete = (
+            shot_count > 0
+            and len(shot_entries) == shot_count
+            and all(
+                isinstance(shot_entries.get(str(index)), Mapping)
+                and valid_file(shot_entries[str(index)].get("path"))
+                and float(shot_entries[str(index)].get("duration_seconds") or 0) > 0
+                and isinstance(shot_entries[str(index)].get("timing"), Mapping)
+                for index in range(1, shot_count + 1)
+            )
+            and valid_file(row["voiceover_path"])
+            and valid_file(row["captions_path"])
+        )
+        if STATUS_INDEX[status] >= STATUS_INDEX["voiced"] and not narration_complete:
+            for path in clips:
+                if path:
+                    Path(path).unlink(missing_ok=True)
+            jobs = json_load(row["queue_jobs_json"], {})
+            if not isinstance(jobs, Mapping):
+                jobs = {}
+            jobs = {
+                key: value
+                for key, value in jobs.items()
+                if not key.startswith(("video:", "assemble"))
+            }
+            self.store.update_run(
+                self.run_id,
+                status="scripted",
+                clips_json="[]",
+                video_requests_json="{}",
+                queue_jobs_json=json.dumps(jobs),
+                voiceover_path=None,
+                captions_path=None,
+                final_path=None,
+            )
+            return
         try:
             expected_frames = self._frame_specs(script)
         except ValueError:
@@ -2120,43 +2698,33 @@ Requirements:
             valid_file(path) or str(path) in regenerating_paths for path in frames
         )
         if STATUS_INDEX[status] >= STATUS_INDEX["framed"] and (not frames_complete):
+            jobs = json_load(row["queue_jobs_json"], {})
+            if not isinstance(jobs, Mapping):
+                jobs = {}
+            jobs = {
+                key: value
+                for key, value in jobs.items()
+                if not key.startswith(("frame:", "video:", "assemble"))
+            }
             self.store.update_run(
                 self.run_id,
-                status="scripted",
+                status="voiced",
                 frames_json="[]",
                 frame_gate_json="{}",
                 clips_json="[]",
                 video_requests_json="{}",
-                queue_jobs_json="{}",
-                voiceover_path=None,
-                captions_path=None,
+                queue_jobs_json=json.dumps(jobs),
                 final_path=None,
             )
             return
         if STATUS_INDEX[status] >= STATUS_INDEX["rendered"] and (
-            len(clips) != SHOT_COUNT or not all(valid_file(path) for path in clips)
+            len(clips) != shot_count or not all(valid_file(path) for path in clips)
         ):
             self.store.update_run(
                 self.run_id,
                 status="framed",
                 clips_json="[]",
                 video_requests_json="{}",
-                queue_jobs_json="{}",
-                voiceover_path=None,
-                captions_path=None,
-                final_path=None,
-            )
-            return
-        if STATUS_INDEX[status] >= STATUS_INDEX["voiced"] and (
-            not valid_file(row["voiceover_path"])
-            or not valid_file(row["captions_path"])
-        ):
-            self.store.update_run(
-                self.run_id,
-                status="rendered",
-                queue_jobs_json="{}",
-                voiceover_path=None,
-                captions_path=None,
                 final_path=None,
             )
             return
@@ -2165,7 +2733,7 @@ Requirements:
         ):
             self.store.update_run(
                 self.run_id,
-                status="voiced",
+                status="rendered",
                 final_path=None,
                 telegram_chat_id=None,
                 telegram_message_id=None,
@@ -2212,12 +2780,19 @@ Requirements:
                 self.run_stage("write_script", self.write_script)
                 continue
             if status == "scripted":
+                self.run_stage(
+                    "generate_voiceover_and_captions",
+                    self.generate_voiceover_and_captions,
+                )
+                continue
+            if status == "voiced":
                 self.run_stage("generate_first_frames", self.generate_first_frames)
                 continue
             if status == "framed":
                 if dry_run:
                     LOG.info(
-                        "Dry run complete after stage 3; run %s is framed",
+                        "Dry run complete after narration and frame generation; "
+                        "run %s is framed",
                         self.run_id,
                     )
                     return self.current()
@@ -2234,12 +2809,6 @@ Requirements:
                 self.run_stage("generate_clips", self.generate_clips)
                 continue
             if status == "rendered":
-                self.run_stage(
-                    "generate_voiceover_and_captions",
-                    self.generate_voiceover_and_captions,
-                )
-                continue
-            if status == "voiced":
                 self.run_stage("assemble", self.assemble)
                 continue
             if status == "assembled":
@@ -2281,7 +2850,9 @@ Requirements:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Create a crash-resumable 50-second vertical explainer video."
+        description=(
+            "Create a crash-resumable, narration-timed vertical explainer video."
+        )
     )
     parser.add_argument(
         "--topic",
@@ -2434,8 +3005,29 @@ def _frame_gate_summary(run: Mapping[str, Any]) -> dict[str, Any]:
     )
     gate = json_load(run.get("frame_gate_json"), {})
     raw_frames = gate.get("frames", []) if isinstance(gate, Mapping) else []
+    script = json_load(run.get("script_json"), {})
+    scripted_shots = (
+        script.get("shots", []) if isinstance(script, Mapping) else []
+    )
+    if isinstance(scripted_shots, list) and scripted_shots:
+        shot_count = len(scripted_shots)
+    else:
+        preset = (
+            run_config.get("preset", {})
+            if isinstance(run_config, Mapping)
+            else {}
+        )
+        target_seconds = (
+            preset.get("target_duration_seconds", PipelineConfig().target_duration_seconds)
+            if isinstance(preset, Mapping)
+            else PipelineConfig().target_duration_seconds
+        )
+        try:
+            shot_count = target_shot_count(float(target_seconds))
+        except (TypeError, ValueError):
+            shot_count = target_shot_count(PipelineConfig().target_duration_seconds)
     grouped: dict[int, list[dict[str, Any]]] = {
-        shot_index: [] for shot_index in range(1, SHOT_COUNT + 1)
+        shot_index: [] for shot_index in range(1, shot_count + 1)
     }
     if isinstance(raw_frames, list):
         ordered_frames = sorted(
