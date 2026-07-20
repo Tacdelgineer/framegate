@@ -12,12 +12,20 @@ script_provider:
 # measured shot narration plus padding, bounded by the per-clip cap.
 target_duration_seconds: 45
 clip_padding: 0.4
-max_clip_seconds: 8.0
-style_block: "Cinematic news documentary photography, realistic lighting. "
+max_clip_seconds: 6.0
+style_block: "isometric voxel diorama, chunky cubic blocks, tilt-shift macro photography, soft studio lighting, vibrant color palette against dark clean background, highly detailed 3D render, shallow depth of field"
 frame_model: flux2_klein
-video_mode: i2v
-video_resolution: 720p
+video_mode: auto
+video_resolution: 720x1280
 steps_draft: 4
 steps_final: 8
-negative_prompt: "text, typography, captions, logos, watermarks, user interface"
+negative_prompt: "text, typography, captions, logos, watermarks, user interface, photorealistic humans, realistic faces"
 fps_out: 30
+caption_style:
+  captions_enabled: true
+  font_size: 72
+  base_color: "#FFFFFF"
+  highlight_color: "#FFD54A"
+  # Percent of frame height above the bottom edge; 20 keeps captions UI-safe.
+  position: 20
+narration_style: "Conversational, curious, direct, and warm."

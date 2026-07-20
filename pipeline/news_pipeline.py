@@ -78,6 +78,7 @@ DEFAULT_PRESET_PATH = MONOREPO_ROOT / "config" / "presets.yaml"
 VISUAL_BACKENDS = {"local", "cloud"}
 VIDEO_MODES = {"i2v", "flf", "auto"}
 DEFAULT_STYLE_BLOCK = "Cinematic news documentary photography, realistic lighting. "
+DEFAULT_NARRATION_STYLE = "Conversational, curious, direct, and warm."
 DEFAULT_SCRIPT_BASE_URL = "http://100.103.129.82:11434/v1"
 DEFAULT_SCRIPT_MODEL = "qwen3.6:35b-a3b"
 
@@ -319,9 +320,7 @@ def concatenate_wavs(
             for reader in readers:
                 output.writeframes(reader.readframes(reader.getnframes()))
             tail_frames = round(tail_seconds * expected[2])
-            output.writeframes(
-                b"\0" * tail_frames * expected[0] * expected[1]
-            )
+            output.writeframes(b"\0" * tail_frames * expected[0] * expected[1])
         os.replace(partial, destination)
     finally:
         partial.unlink(missing_ok=True)
@@ -416,6 +415,71 @@ class ScriptProviderConfig:
 
 
 @dataclass(frozen=True)
+class CaptionStyleConfig:
+    captions_enabled: bool = True
+    font_size: int = 72
+    base_color: str = "#FFFFFF"
+    highlight_color: str = "#FFD54A"
+    position: float = 20.0
+
+    @classmethod
+    def from_mapping(cls, values: Mapping[str, Any]) -> "CaptionStyleConfig":
+        expected = set(cls.__dataclass_fields__)
+        unknown = set(values) - expected
+        if unknown:
+            raise ValueError(
+                "Unknown caption_style keys: " + ", ".join(sorted(unknown))
+            )
+        config = cls(
+            captions_enabled=values.get("captions_enabled", True),
+            font_size=values.get("font_size", 72),
+            base_color=values.get("base_color", "#FFFFFF"),
+            highlight_color=values.get("highlight_color", "#FFD54A"),
+            position=values.get("position", 20.0),
+        )
+        config.validate()
+        return config
+
+    def validate(self) -> None:
+        if not isinstance(self.captions_enabled, bool):
+            raise ValueError("caption_style.captions_enabled must be a boolean")
+        if (
+            isinstance(self.font_size, bool)
+            or not isinstance(self.font_size, int)
+            or self.font_size <= 0
+        ):
+            raise ValueError("caption_style.font_size must be a positive integer")
+        for name in ("base_color", "highlight_color"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not re.fullmatch(
+                r"#[0-9A-Fa-f]{6}", value
+            ):
+                raise ValueError(f"caption_style.{name} must use #RRGGBB format")
+        if self.base_color.casefold() == self.highlight_color.casefold():
+            raise ValueError(
+                "caption_style.highlight_color must differ from base_color"
+            )
+        if (
+            isinstance(self.position, bool)
+            or not isinstance(self.position, (int, float))
+            or not 0 < self.position < 50
+        ):
+            raise ValueError(
+                "caption_style.position must be a number between 0 and 50 "
+                "representing percent of frame height from the bottom"
+            )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "captions_enabled": self.captions_enabled,
+            "font_size": self.font_size,
+            "base_color": self.base_color,
+            "highlight_color": self.highlight_color,
+            "position": self.position,
+        }
+
+
+@dataclass(frozen=True)
 class PipelineConfig:
     script_provider: ScriptProviderConfig = field(default_factory=ScriptProviderConfig)
     target_duration_seconds: float = 45.0
@@ -431,6 +495,8 @@ class PipelineConfig:
         "text, typography, captions, logos, watermarks, user interface"
     )
     fps_out: int = 30
+    caption_style: CaptionStyleConfig = field(default_factory=CaptionStyleConfig)
+    narration_style: str = DEFAULT_NARRATION_STYLE
 
     @classmethod
     def from_mapping(cls, values: Mapping[str, Any]) -> "PipelineConfig":
@@ -442,6 +508,9 @@ class PipelineConfig:
         raw_script_provider = merged["script_provider"]
         if not isinstance(raw_script_provider, Mapping):
             raise ValueError("script_provider must be a YAML mapping")
+        raw_caption_style = merged["caption_style"]
+        if not isinstance(raw_caption_style, Mapping):
+            raise ValueError("caption_style must be a YAML mapping")
         config = cls(
             script_provider=ScriptProviderConfig.from_mapping(raw_script_provider),
             target_duration_seconds=merged["target_duration_seconds"],
@@ -455,6 +524,8 @@ class PipelineConfig:
             steps_final=merged["steps_final"],
             negative_prompt=merged["negative_prompt"],
             fps_out=merged["fps_out"],
+            caption_style=CaptionStyleConfig.from_mapping(raw_caption_style),
+            narration_style=merged["narration_style"],
         )
         config.validate()
         return config
@@ -473,11 +544,14 @@ class PipelineConfig:
 
     def validate(self) -> None:
         self.script_provider.validate()
+        self.caption_style.validate()
         for name in ("style_block", "frame_model", "video_resolution"):
             if not isinstance(getattr(self, name), str) or not getattr(self, name):
                 raise ValueError(f"{name} must be a non-empty string")
         if not isinstance(self.negative_prompt, str):
             raise ValueError("negative_prompt must be a string")
+        if not isinstance(self.narration_style, str):
+            raise ValueError("narration_style must be a string")
         if self.video_mode not in VIDEO_MODES:
             raise ValueError(
                 "video_mode must be one of: " + ", ".join(sorted(VIDEO_MODES))
@@ -517,7 +591,218 @@ class PipelineConfig:
             "steps_final": self.steps_final,
             "negative_prompt": self.negative_prompt,
             "fps_out": self.fps_out,
+            "caption_style": self.caption_style.to_dict(),
+            "narration_style": self.narration_style,
         }
+
+
+def extract_timestamped_words(
+    transcription: Mapping[str, Any],
+) -> list[dict[str, float | str]]:
+    """Normalize faster-whisper word timestamps from common response shapes."""
+    raw_words = transcription.get("words")
+    if not isinstance(raw_words, list) or not raw_words:
+        raw_words = []
+        segments = transcription.get("segments")
+        if isinstance(segments, list):
+            for segment in segments:
+                if isinstance(segment, Mapping) and isinstance(
+                    segment.get("words"), list
+                ):
+                    raw_words.extend(segment["words"])
+
+    words: list[dict[str, float | str]] = []
+    for item in raw_words:
+        if not isinstance(item, Mapping):
+            continue
+        text = str(item.get("word") or item.get("text") or "").strip()
+        try:
+            start = float(item["start"])
+            end = float(item["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if text and end > start >= 0:
+            words.append({"start": start, "end": end, "text": text})
+    if not words:
+        raise ValueError("Transcription contains no valid word-level timestamps")
+    return words
+
+
+def chunk_caption_words(
+    words: list[dict[str, float | str]],
+) -> list[list[dict[str, float | str]]]:
+    """Group a transcript into compact two- or three-word caption events."""
+    chunks: list[list[dict[str, float | str]]] = []
+    position = 0
+    while position < len(words):
+        remaining = len(words) - position
+        if remaining == 4:
+            size = 2
+        else:
+            size = min(3, remaining)
+        chunks.append(words[position : position + size])
+        position += size
+    return chunks
+
+
+def _centiseconds(seconds: float) -> int:
+    return max(0, math.floor(seconds * 100 + 0.5))
+
+
+def _ass_timestamp(centiseconds: int) -> str:
+    hours, remainder = divmod(max(0, centiseconds), 360_000)
+    minutes, remainder = divmod(remainder, 6_000)
+    seconds, hundredths = divmod(remainder, 100)
+    return f"{hours}:{minutes:02d}:{seconds:02d}.{hundredths:02d}"
+
+
+def _ass_color(rgb: str) -> str:
+    red, green, blue = rgb[1:3], rgb[3:5], rgb[5:7]
+    return f"&H00{blue}{green}{red}".upper()
+
+
+def _ass_text(text: str) -> str:
+    return (
+        text.replace("\\", r"\\")
+        .replace("{", r"\{")
+        .replace("}", r"\}")
+        .replace("\r", " ")
+        .replace("\n", " ")
+    )
+
+
+def _karaoke_text(chunk: list[dict[str, float | str]]) -> tuple[int, int, str]:
+    event_start = _centiseconds(float(chunk[0]["start"]))
+    cursor = event_start
+    parts = [r"{\q2}"]
+    for index, word in enumerate(chunk):
+        word_start = max(cursor, _centiseconds(float(word["start"])))
+        word_end = max(word_start + 1, _centiseconds(float(word["end"])))
+        if index:
+            gap = word_start - cursor
+            parts.append(f"{{\\k{gap}}} " if gap else " ")
+        parts.append(f"{{\\k{word_end - word_start}}}{_ass_text(str(word['text']))}")
+        cursor = word_end
+    return event_start, cursor, "".join(parts)
+
+
+def build_ass_subtitles(
+    transcription: Mapping[str, Any],
+    style: CaptionStyleConfig,
+    *,
+    width: int = 1080,
+    height: int = 1920,
+) -> str:
+    """Build one-line, lower-third ASS karaoke captions from word timestamps."""
+    style.validate()
+    if width <= 0 or height <= 0:
+        raise ValueError("ASS play resolution must be positive")
+    words = extract_timestamped_words(transcription)
+    margin_v = round(height * float(style.position) / 100)
+    lines = [
+        "[Script Info]",
+        "ScriptType: v4.00+",
+        f"PlayResX: {width}",
+        f"PlayResY: {height}",
+        "WrapStyle: 2",
+        "ScaledBorderAndShadow: yes",
+        "",
+        "[V4+ Styles]",
+        (
+            "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
+            "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, "
+            "ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
+            "Alignment, MarginL, MarginR, MarginV, Encoding"
+        ),
+        (
+            f"Style: Karaoke,Arial,{style.font_size},"
+            f"{_ass_color(style.highlight_color)},{_ass_color(style.base_color)},"
+            "&H00000000,&H96000000,-1,0,0,0,100,100,0,0,1,4,3,2,"
+            f"60,60,{margin_v},1"
+        ),
+        "",
+        "[Events]",
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+    ]
+    for chunk in chunk_caption_words(words):
+        start, end, text = _karaoke_text(chunk)
+        lines.append(
+            f"Dialogue: 0,{_ass_timestamp(start)},{_ass_timestamp(end)},"
+            f"Karaoke,,0,0,0,,{text}"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def write_ass_subtitles(
+    transcription_path: Path,
+    destination: Path,
+    style: CaptionStyleConfig,
+) -> None:
+    try:
+        transcription = json.loads(transcription_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            f"Could not read transcription JSON: {transcription_path}"
+        ) from exc
+    if not isinstance(transcription, Mapping):
+        raise ValueError("Transcription JSON must be an object")
+    atomic_write_bytes(
+        destination,
+        build_ass_subtitles(transcription, style).encode("utf-8"),
+    )
+
+
+def burn_ass_subtitles(
+    video_path: Path,
+    captions_path: Path,
+    destination: Path,
+) -> None:
+    escaped = (
+        str(captions_path.resolve())
+        .replace("\\", "\\\\")
+        .replace(":", "\\:")
+        .replace("'", "\\'")
+    )
+    partial = destination.with_name(
+        f".{destination.stem}.{uuid.uuid4().hex}.part{destination.suffix}"
+    )
+    try:
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-i",
+                str(video_path),
+                "-vf",
+                f"subtitles=filename='{escaped}'",
+                "-map",
+                "0:v:0",
+                "-map",
+                "0:a:0?",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "medium",
+                "-crf",
+                "20",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "copy",
+                "-movflags",
+                "+faststart",
+                str(partial),
+            ],
+            check=True,
+        )
+        os.replace(partial, destination)
+    except (FileNotFoundError, subprocess.CalledProcessError) as exc:
+        raise ValueError(f"Could not burn ASS captions into {video_path}") from exc
+    finally:
+        partial.unlink(missing_ok=True)
 
 
 def load_environment(project_root: Path) -> None:
@@ -783,9 +1068,7 @@ class StateStore:
             if "run_config_json" not in columns:
                 connection.execute("ALTER TABLE runs ADD COLUMN run_config_json TEXT")
             if "shot_audio_json" not in columns:
-                connection.execute(
-                    "ALTER TABLE runs ADD COLUMN shot_audio_json TEXT"
-                )
+                connection.execute("ALTER TABLE runs ADD COLUMN shot_audio_json TEXT")
 
     def create_run(self, topic: str) -> dict[str, Any]:
         run_id = str(uuid.uuid4())
@@ -1225,10 +1508,11 @@ visually without on-screen text.
         average_seconds = target_seconds / shot_count
         system_prompt = (
             "You write original, accurate, fast-paced evergreen explainer "
-            "scripts for vertical video. Return only valid JSON. Stay within "
-            "the supplied topic brief and do not invent sources, quotes, "
-            "statistics, or timely claims. Each shot must have exactly one "
-            "simple camera move as its motion instruction."
+            "scripts for vertical video. Write narration for the ear, not the "
+            "page. Return only valid JSON. Stay within the supplied topic "
+            "brief and do not invent sources, quotes, statistics, or timely "
+            "claims. Each shot must have exactly one simple camera move as "
+            "its motion instruction."
         )
         user_prompt = f"""
 Turn this topic brief into an original evergreen YouTube explainer targeting
@@ -1240,6 +1524,9 @@ TOPIC BRIEF:
 
 STYLE BLOCK (copy this exact string at the beginning of every frame prompt):
 {json.dumps(self.config.style_block, ensure_ascii=False)}
+
+NARRATION STYLE (apply this free-text direction to the spoken voice):
+{json.dumps(self.config.narration_style, ensure_ascii=False)}
 
 Return exactly:
 {{
@@ -1268,8 +1555,21 @@ Requirements:
 - {mode_instruction}
 - Begin every non-null frame prompt with the STYLE BLOCK exactly as supplied.
 - No visible text, logos, watermarks, captions, or UI in image prompts.
+- Write for the ear, not the page. Use contractions always; never use an
+  expanded form when a natural contraction exists.
+- Keep every narration sentence under 12 words.
+- Use second person ("you") where it sounds natural.
+- Choose concrete images over abstractions.
+- Never use stock AI phrasing, including "delve", "tapestry", "in today's
+  world", "imagine a world", or "it's important to note".
+- Every shot after the first must connect to the previous shot with a natural
+  spoken-language transition.
+- The final narration line must open a question or land a punchy fact. It must
+  never summarize the explainer.
 - Make each narration line original and explanatory, with no claim of live
   reporting or external sourcing.
+- Before returning JSON, reread all narration as if speaking it aloud. Rewrite
+  any sentence a person wouldn't say to a friend.
 """.strip()
         script, _ = self._script_chat(
             system_prompt=system_prompt,
@@ -1878,9 +2178,7 @@ Return exactly:
             retry_used = bool(entry.get("shorten_retry_used"))
             attempt = 2 if retry_used else 1
             shot_path = (
-                self.run_dir
-                / "voiceover"
-                / f"shot_{index:02d}_attempt_{attempt}.wav"
+                self.run_dir / "voiceover" / f"shot_{index:02d}_attempt_{attempt}.wav"
             )
             self._queue_job(
                 f"tts:{index}:attempt:{attempt}",
@@ -1989,8 +2287,7 @@ Return exactly:
             self._persist_shot_audio_state(state)
 
         state["shots"] = {
-            str(index): entries[str(index)]
-            for index in range(1, len(shots) + 1)
+            str(index): entries[str(index)] for index in range(1, len(shots) + 1)
         }
         narration_seconds = sum(
             float(entry["duration_seconds"]) for entry in state["shots"].values()
@@ -2016,31 +2313,37 @@ Return exactly:
             voiceover_path=str(voiceover_path),
         )
 
-        captions_path = self.run_dir / "captions.srt"
-        if (
-            state.get("captions_for_voiceover_sha256") != fingerprint
-            and captions_path.exists()
-        ):
-            captions_path.unlink()
-        self._queue_job(
-            f"transcribe:{fingerprint[:16]}",
-            "transcribe",
-            {
-                "format": "srt",
-                "language": "en",
-                "word_timestamps": True,
-            },
-            {"audio": voiceover_path},
-            captions_path,
-        )
-        state["captions_for_voiceover_sha256"] = fingerprint
+        captions_path: Path | None = None
+        if self.config.caption_style.captions_enabled:
+            transcription_path = self.run_dir / "transcription.json"
+            captions_path = self.run_dir / "captions.ass"
+            if state.get("captions_for_voiceover_sha256") != fingerprint:
+                transcription_path.unlink(missing_ok=True)
+                captions_path.unlink(missing_ok=True)
+            self._queue_job(
+                f"transcribe:{fingerprint[:16]}",
+                "transcribe",
+                {
+                    "format": "json",
+                    "language": "en",
+                    "word_timestamps": True,
+                },
+                {"audio": voiceover_path},
+                transcription_path,
+            )
+            write_ass_subtitles(
+                transcription_path,
+                captions_path,
+                self.config.caption_style,
+            )
+            state["captions_for_voiceover_sha256"] = fingerprint
         self.store.update_run(
             self.run_id,
             status="voiced",
             script_json=json.dumps(script),
             shot_audio_json=json.dumps(state),
             voiceover_path=str(voiceover_path),
-            captions_path=str(captions_path),
+            captions_path=str(captions_path) if captions_path else None,
             last_error=None,
         )
 
@@ -2074,14 +2377,15 @@ Return exactly:
         script = json_load(row["script_json"], {})
         shots = script.get("shots", [])
         voiceover = Path(row["voiceover_path"] or "")
-        captions = Path(row["captions_path"] or "")
+        captions_enabled = self.config.caption_style.captions_enabled
+        captions = Path(row["captions_path"] or "") if captions_enabled else None
         if (
             not isinstance(shots, list)
             or not shots
             or len(clips) != len(shots)
             or not all(valid_file(path) for path in clips)
             or not valid_file(voiceover)
-            or not valid_file(captions)
+            or (captions_enabled and not valid_file(captions))
         ):
             raise ValueError("Assemble inputs are incomplete")
         shot_audio_state = self._shot_audio_state()
@@ -2089,9 +2393,7 @@ Return exactly:
             video_seconds = sum(media_duration_seconds(path) for path in clips)
         except ValueError:
             video_seconds = sum(
-                float(
-                    self._shot_timing(shot_audio_state, index)["generated_seconds"]
-                )
+                float(self._shot_timing(shot_audio_state, index)["generated_seconds"])
                 for index in range(1, len(shots) + 1)
             )
         voiceover_seconds = wav_duration_seconds(voiceover)
@@ -2102,24 +2404,24 @@ Return exactly:
         video_filter = f"minterpolate=fps={self.config.fps_out}"
         if timing["video_pad_seconds"] > 0:
             video_filter += (
-                ",tpad=stop_mode=clone:"
-                f"stop_duration={timing['video_pad_seconds']:.6f}"
+                f",tpad=stop_mode=clone:stop_duration={timing['video_pad_seconds']:.6f}"
             )
         final_path = self.run_dir / "final.mp4"
+        assembled_path = (
+            self.run_dir / "assembled_without_captions.mp4"
+            if captions_enabled
+            else final_path
+        )
         inputs: dict[str, Path] = {
             f"clip_{index}": path for index, path in enumerate(clips, start=1)
         }
         inputs["voiceover"] = voiceover
-        inputs["captions"] = captions
         self._queue_job(
-            "assemble",
+            "assemble:ass-v1" if captions_enabled else "assemble:no-captions-v1",
             "assemble",
             {
-                "clip_roles": [
-                    f"clip_{index}" for index in range(1, len(clips) + 1)
-                ],
+                "clip_roles": [f"clip_{index}" for index in range(1, len(clips) + 1)],
                 "voiceover_role": "voiceover",
-                "captions_role": "captions",
                 "clip_timings": [
                     self._shot_timing(shot_audio_state, index)
                     for index in range(1, len(shots) + 1)
@@ -2135,12 +2437,15 @@ Return exactly:
                 "tail_room_seconds": timing["tail_seconds"],
                 "trim_audio": False,
                 "shortest": False,
-                "burn_captions": True,
+                "burn_captions": False,
                 "output_format": "mp4",
             },
             inputs,
-            final_path,
+            assembled_path,
         )
+        if captions_enabled:
+            assert captions is not None
+            burn_ass_subtitles(assembled_path, captions, final_path)
         self.store.update_run(
             self.run_id,
             status="assembled",
@@ -2677,6 +2982,8 @@ Return exactly:
             row["voiceover_path"],
             row["captions_path"],
             row["final_path"],
+            self.run_dir / "transcription.json",
+            self.run_dir / "assembled_without_captions.mp4",
         ]
         for raw_path in paths:
             if raw_path:
@@ -2727,7 +3034,10 @@ Return exactly:
                 for index in range(1, shot_count + 1)
             )
             and valid_file(row["voiceover_path"])
-            and valid_file(row["captions_path"])
+            and (
+                not self.config.caption_style.captions_enabled
+                or valid_file(row["captions_path"])
+            )
         )
         if STATUS_INDEX[status] >= STATUS_INDEX["voiced"] and not narration_complete:
             for path in clips:
@@ -3077,19 +3387,15 @@ def _frame_gate_summary(run: Mapping[str, Any]) -> dict[str, Any]:
     gate = json_load(run.get("frame_gate_json"), {})
     raw_frames = gate.get("frames", []) if isinstance(gate, Mapping) else []
     script = json_load(run.get("script_json"), {})
-    scripted_shots = (
-        script.get("shots", []) if isinstance(script, Mapping) else []
-    )
+    scripted_shots = script.get("shots", []) if isinstance(script, Mapping) else []
     if isinstance(scripted_shots, list) and scripted_shots:
         shot_count = len(scripted_shots)
     else:
-        preset = (
-            run_config.get("preset", {})
-            if isinstance(run_config, Mapping)
-            else {}
-        )
+        preset = run_config.get("preset", {}) if isinstance(run_config, Mapping) else {}
         target_seconds = (
-            preset.get("target_duration_seconds", PipelineConfig().target_duration_seconds)
+            preset.get(
+                "target_duration_seconds", PipelineConfig().target_duration_seconds
+            )
             if isinstance(preset, Mapping)
             else PipelineConfig().target_duration_seconds
         )

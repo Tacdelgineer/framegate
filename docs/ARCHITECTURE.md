@@ -81,8 +81,8 @@ to xAI instead. Pipeline state and both approval gates remain on the VPS.
 | Voiceover | DGX | worker-configured, pending sync | One persisted `tts` result per shot, generated before video |
 | Video clips (local default) | DGX | worker-configured workflow | I2V or first/last-frame, narration + padding, Wan `4n+1` frames at 16fps |
 | Video clips (cloud) | VPS | xAI `grok-imagine-video` | Narration-derived duration, capped by the preset |
-| Captions | DGX | worker-configured, pending sync | Queue type `transcribe` |
-| Assembly | DGX | ffmpeg | `minterpolate`, caption burn, and final-frame `tpad` when video is shorter; audio is never trimmed |
+| Captions | DGX + VPS | faster-whisper + ASS | Word timestamps become 2–3-word karaoke events on the VPS |
+| Assembly | DGX + VPS | ffmpeg | DGX assembles and pads; VPS burns the ASS track with the subtitles filter; audio is never trimmed |
 
 The script provider and local visual/assembly settings come from
 `config/presets.yaml` and are snapshotted per run. Hosted script providers use

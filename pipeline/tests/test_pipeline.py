@@ -78,6 +78,25 @@ class RecordingQueue(FakeQueue):
                 else float(submission["payload"]["target_duration_seconds"])
             )
             write_wav(path, duration)
+        elif submission["job_type"] == "transcribe":
+            path.write_text(
+                json.dumps(
+                    {
+                        "language": "en",
+                        "words": [
+                            {
+                                "word": word,
+                                "start": index * 0.5,
+                                "end": index * 0.5 + 0.4,
+                            }
+                            for index, word in enumerate(
+                                ("These", "are", "timed", "caption", "test", "words")
+                            )
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
         else:
             path.write_bytes(f"result for {job_id}".encode())
         self._jobs[job_id]["status"] = "done"
@@ -165,7 +184,7 @@ class DryRunPipeline(module.NewsPipeline):
             }
         voiceover = self.run_dir / "voiceover.wav"
         module.concatenate_wavs(paths, voiceover)
-        captions = self.run_dir / "captions.srt"
+        captions = self.run_dir / "captions.ass"
         captions.write_text("1\n00:00:00,000 --> 00:00:01,000\nTest\n")
         self.store.update_run(
             self.run_id,
@@ -201,9 +220,7 @@ def test_dry_run_stops_after_framing_and_resumes(tmp_path: Path) -> None:
     assert result["status"] == "framed"
     assert len(json.loads(result["frames_json"])) == 5
     assert store.latest_resumable()["id"] == run["id"]
-    assert [
-        attempt["stage"] for attempt in store.attempts_for_run(run["id"])
-    ] == [
+    assert [attempt["stage"] for attempt in store.attempts_for_run(run["id"])] == [
         "fetch_story",
         "write_script",
         "generate_voiceover_and_captions",
@@ -218,7 +235,7 @@ def test_repair_rolls_missing_frames_back_to_voiced(tmp_path: Path) -> None:
     run_dir = config.work_root / run["id"]
     shot_path = run_dir / "voiceover" / "shot_01_attempt_1.wav"
     voiceover_path = run_dir / "voiceover.wav"
-    captions_path = run_dir / "captions.srt"
+    captions_path = run_dir / "captions.ass"
     write_wav(shot_path, 5)
     write_wav(voiceover_path, 5.5)
     captions_path.write_text("captions")
@@ -337,8 +354,7 @@ def test_worker_error_classification_preserves_transient_retries() -> None:
         "validation",
         job={
             "error": (
-                "PipelineError: video payload requires exactly one or two "
-                "input frames"
+                "PipelineError: video payload requires exactly one or two input frames"
             )
         },
     )
@@ -389,10 +405,7 @@ def test_queue_job_reports_non_retryable_validation_for_the_shot(
     try:
         with pytest.raises(
             module.NonRetryableWorkerError,
-            match=(
-                "Shot 9 was rejected by worker payload validation; "
-                "not retrying"
-            ),
+            match=("Shot 9 was rejected by worker payload validation; not retrying"),
         ):
             pipeline._queue_job(
                 "video:9",
@@ -442,6 +455,70 @@ def test_narration_timing_rounds_to_wan_frames_and_honors_cap() -> None:
     assert assembly["video_pad_seconds"] == pytest.approx(0.49)
     assert assembly["output_seconds"] == 25.82
     assert assembly["tail_seconds"] == 0.5
+
+
+def test_ass_captions_use_two_or_three_word_chunks() -> None:
+    transcription = {
+        "words": [
+            {"word": word, "start": index * 0.25, "end": index * 0.25 + 0.2}
+            for index, word in enumerate(
+                ("one", "two", "three", "four", "five", "six", "seven", "eight")
+            )
+        ]
+    }
+
+    words = module.extract_timestamped_words(transcription)
+    chunks = module.chunk_caption_words(words)
+    ass = module.build_ass_subtitles(transcription, module.CaptionStyleConfig())
+    dialogues = [line for line in ass.splitlines() if line.startswith("Dialogue:")]
+
+    assert [len(chunk) for chunk in chunks] == [3, 3, 2]
+    assert len(dialogues) == 3
+    assert all("\\N" not in line for line in dialogues)
+    assert "WrapStyle: 2" in ass
+    assert "Arial,72" in ass
+    assert "-1,0,0,0,100,100,0,0,1,4,3,2,60,60,384,1" in ass
+
+
+def test_ass_karaoke_timing_tracks_words_and_silence_in_centiseconds() -> None:
+    transcription = {
+        "words": [
+            {"word": "Look", "start": 1.0, "end": 1.35},
+            {"word": "right", "start": 1.4, "end": 1.72},
+            {"word": "here", "start": 1.72, "end": 2.01},
+            {"word": "Then", "start": 2.2, "end": 2.5},
+            {"word": "watch", "start": 2.55, "end": 2.9},
+        ]
+    }
+
+    ass = module.build_ass_subtitles(
+        transcription,
+        module.CaptionStyleConfig(
+            base_color="#FFFFFF",
+            highlight_color="#FF0000",
+        ),
+    )
+    dialogues = [line for line in ass.splitlines() if line.startswith("Dialogue:")]
+
+    assert dialogues == [
+        (
+            "Dialogue: 0,0:00:01.00,0:00:02.01,Karaoke,,0,0,0,,"
+            r"{\q2}{\k35}Look{\k5} {\k32}right {\k29}here"
+        ),
+        (
+            "Dialogue: 0,0:00:02.20,0:00:02.90,Karaoke,,0,0,0,,"
+            r"{\q2}{\k30}Then{\k5} {\k35}watch"
+        ),
+    ]
+    assert "&H000000FF,&H00FFFFFF" in ass
+
+
+def test_caption_highlight_color_must_be_distinct() -> None:
+    with pytest.raises(ValueError, match="must differ from base_color"):
+        module.CaptionStyleConfig(
+            base_color="#ffffff",
+            highlight_color="#FFFFFF",
+        ).validate()
 
 
 def test_persisted_approval_is_available_after_restart(tmp_path: Path) -> None:
@@ -652,7 +729,13 @@ def test_first_frames_use_gpt_image_1_portrait_contract(tmp_path: Path) -> None:
 
 def test_queue_media_stages_use_required_job_types_and_roles(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(
+        module,
+        "burn_ass_subtitles",
+        lambda _video, _captions, destination: destination.write_bytes(b"captioned"),
+    )
     config = settings(tmp_path)
     store = module.StateStore(config.database_path)
     run = store.create_run("test")
@@ -704,7 +787,6 @@ def test_queue_media_stages_use_required_job_types_and_roles(
         "clip_4",
         "clip_5",
         "voiceover",
-        "captions",
     }
     assembly = queue.submissions[6]["payload"]
     assert assembly["input_fps"] == 16
@@ -712,6 +794,7 @@ def test_queue_media_stages_use_required_job_types_and_roles(
     assert assembly["pre_caption_video_filter"] == "minterpolate=fps=30"
     assert assembly["trim_audio"] is False
     assert assembly["shortest"] is False
+    assert assembly["burn_captions"] is False
     assert assembly["tail_room_seconds"] == 0.5
     assert store.get_run(run["id"])["status"] == "assembled"
 
@@ -745,6 +828,38 @@ def test_per_shot_tts_state_resumes_without_requeue(tmp_path: Path) -> None:
         for entry in state["shots"].values()
     )
     assert module.wav_duration_seconds(Path(saved["voiceover_path"])) == 30.5
+
+
+def test_disabled_captions_skip_transcription(tmp_path: Path) -> None:
+    config = settings(tmp_path)
+    store = module.StateStore(config.database_path)
+    run = store.create_run("test")
+    shots = [{"voiceover_text": f"Voice {index}"} for index in range(1, 3)]
+    run = store.update_run(
+        run["id"],
+        status="scripted",
+        script_json=json.dumps({"shots": shots}),
+    )
+    queue = RecordingQueue()
+    pipeline = module.NewsPipeline(
+        config,
+        store,
+        run,
+        config=module.PipelineConfig(
+            caption_style=module.CaptionStyleConfig(captions_enabled=False)
+        ),
+        queue_client=queue,
+    )
+    try:
+        pipeline.generate_voiceover_and_captions()
+        pipeline.repair_state()
+    finally:
+        pipeline.close()
+
+    saved = store.get_run(run["id"])
+    assert [job["job_type"] for job in queue.submissions] == ["tts", "tts"]
+    assert saved["captions_path"] is None
+    assert saved["status"] == "voiced"
 
 
 def test_long_narration_gets_one_shortening_retry_and_persists_it(
@@ -798,7 +913,7 @@ def test_assembly_tpad_holds_last_frame_and_never_trims_audio(
     clip.write_bytes(b"clip")
     voiceover = run_dir / "voiceover.wav"
     write_wav(voiceover, 10.5)
-    captions = run_dir / "captions.srt"
+    captions = run_dir / "captions.ass"
     captions.write_text("captions")
     timing = module.clip_timing(
         10,
@@ -826,6 +941,11 @@ def test_assembly_tpad_holds_last_frame_and_never_trims_audio(
         ),
     )
     monkeypatch.setattr(module, "media_duration_seconds", lambda _: 5.0)
+    monkeypatch.setattr(
+        module,
+        "burn_ass_subtitles",
+        lambda _video, _captions, destination: destination.write_bytes(b"captioned"),
+    )
     queue = RecordingQueue()
     pipeline = module.NewsPipeline(config, store, run, queue_client=queue)
     try:
@@ -835,8 +955,7 @@ def test_assembly_tpad_holds_last_frame_and_never_trims_audio(
 
     payload = queue.submissions[0]["payload"]
     assert payload["pre_caption_video_filter"] == (
-        "minterpolate=fps=30,"
-        "tpad=stop_mode=clone:stop_duration=5.500000"
+        "minterpolate=fps=30,tpad=stop_mode=clone:stop_duration=5.500000"
     )
     assert payload["video_pad_seconds"] == 5.5
     assert payload["output_duration_seconds"] == 10.5
@@ -854,10 +973,19 @@ def test_default_preset_loads_and_cli_defaults_local() -> None:
     assert preset.script_provider.api_key_env is None
     assert preset.target_duration_seconds == 45
     assert preset.clip_padding == 0.4
-    assert preset.max_clip_seconds == 8
+    assert preset.max_clip_seconds == 6
     assert preset.frame_model == "flux2_klein"
-    assert preset.video_mode == "i2v"
+    assert preset.video_mode == "auto"
+    assert preset.video_resolution == "720x1280"
     assert preset.fps_out == 30
+    assert preset.caption_style == module.CaptionStyleConfig(
+        captions_enabled=True,
+        font_size=72,
+        base_color="#FFFFFF",
+        highlight_color="#FFD54A",
+        position=20,
+    )
+    assert preset.narration_style == "Conversational, curious, direct, and warm."
     assert args.visuals == "local"
     assert args.frame_gate is True
 
@@ -1097,9 +1225,7 @@ def test_video_job_builder_matches_worker_contract(
     finally:
         queue.close()
     multipart_roles = re.findall(rb'name="(input:[^"]+)"', request_body)
-    assert multipart_roles == [
-        f"input:{role}".encode() for role in expected_roles
-    ]
+    assert multipart_roles == [f"input:{role}".encode() for role in expected_roles]
 
     worker = load_worker_contract_module()
     worker_payload = dict(payload)
@@ -1372,6 +1498,67 @@ def test_script_normalizes_motion_mode_and_verbatim_style(tmp_path: Path) -> Non
     assert "4-6 second range" in prompt
     assert "about 45 seconds" in prompt
     assert "Exactly one short camera move" in prompt
+    assert "Write for the ear, not the page" in prompt
+    assert "Keep every narration sentence under 12 words" in prompt
+    assert 'Use second person ("you")' in prompt
+    assert '"delve", "tapestry"' in prompt
+    assert "connect to the previous shot" in prompt
+    assert "never summarize the explainer" in prompt
+    assert "a person wouldn't say to a friend" in prompt
+
+
+def test_narration_style_is_injected_into_script_prompt(tmp_path: Path) -> None:
+    shot_count = module.target_shot_count(45)
+    response_script = {
+        "title": "Test",
+        "description": "Description",
+        "shots": [
+            {
+                "voiceover_text": f"Voice {index}",
+                "motion_instruction": "slow push-in",
+                "video_mode": "i2v",
+                "first_frame_prompt": f"Subject {index}",
+                "last_frame_prompt": None,
+            }
+            for index in range(1, shot_count + 1)
+        ],
+    }
+    request_payload = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        request_payload.update(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": json.dumps(response_script)}}]},
+        )
+
+    config = settings(tmp_path)
+    store = module.StateStore(config.database_path)
+    run = store.create_run("test")
+    run = store.update_run(
+        run["id"],
+        status="fetched",
+        story_json=json.dumps({"title": "Story", "summary": "Summary"}),
+    )
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    pipeline = module.NewsPipeline(
+        config,
+        store,
+        run,
+        config=module.PipelineConfig(narration_style="Dry, wry, and understated."),
+        visuals="local",
+        frame_gate=False,
+        http_client=client,
+        queue_client=FakeQueue(),
+    )
+    try:
+        pipeline.write_script()
+    finally:
+        pipeline.close()
+        client.close()
+
+    prompt = request_payload["messages"][1]["content"]
+    assert '"Dry, wry, and understated."' in prompt
 
 
 def test_run_configuration_is_snapshotted_for_resume(tmp_path: Path) -> None:

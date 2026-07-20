@@ -129,9 +129,13 @@ Limit changes to `script_provider.base_url`, `script_provider.model`,
 `script_provider.api_key_env`, `target_duration_seconds`, `clip_padding`,
 `max_clip_seconds`, `style_block`, `frame_model`, `video_mode`,
 `video_resolution`, `steps_draft`, `steps_final`, `fps_out`, and
-`negative_prompt`. The script provider is independent of `--visuals`; changing
-one never implies changing the other. Use `api_key_env: null` for keyless
-Ollama, `XAI_API_KEY` for xAI, or `OPENAI_API_KEY` for OpenAI.
+`negative_prompt`; `caption_style.captions_enabled`,
+`caption_style.font_size`, `caption_style.base_color`,
+`caption_style.highlight_color`, `caption_style.position`; and
+`narration_style`. Caption colors use `#RRGGBB`; caption position is the percent
+of frame height above the bottom edge. The script provider is independent of
+`--visuals`; changing one never implies changing the other. Use `api_key_env:
+null` for keyless Ollama, `XAI_API_KEY` for xAI, or `OPENAI_API_KEY` for OpenAI.
 
 1. Read `/home/alireza/content-factory/config/presets.yaml`.
 2. Prepare a before/after unified diff without writing any file.
@@ -176,7 +180,10 @@ original snapshot:
   narration each.
 - `clip_padding` (default `0.4`) is added to each measured narration segment
   before its video length is calculated.
-- `max_clip_seconds` (default `8.0`) caps each requested clip.
+- `max_clip_seconds` (currently `6.0`) caps each requested clip.
+- `caption_style` controls whether captions are enabled and their font size,
+  base/highlight colors, and bottom-safe vertical position.
+- `narration_style` is free-text tone guidance injected into the script prompt.
 
 The execution order is now `scripted → voiced → framed → rendered`: TTS runs
 and is measured per shot before any video job. Per-shot WAV paths and timing

@@ -46,7 +46,9 @@ preset controls `target_duration_seconds`, `clip_padding`,
 `max_clip_seconds`, the verbatim frame-prompt `style_block`, local frame
 workflow, I2V/first-last-frame selection, resolution, draft/final steps,
 negative prompt, output FPS, and the independent OpenAI-compatible
-`script_provider`.
+`script_provider`. The free-text `narration_style` is injected into the script
+prompt. `caption_style` controls caption enablement, size, base/highlight
+colors, and vertical position.
 
 The script prompt requests enough 4–6-second narration shots to fill
 `target_duration_seconds` (nine shots at the 45-second default). TTS runs once
@@ -95,12 +97,14 @@ only that frame. Final-video Regenerate deletes generated media, rewinds to
   `input:start_frame` and optional `input:end_frame`; payload contains the
   motion instruction, resolution, final steps, seed, narration-derived
   `duration_seconds`, `frame_count`, and 16fps input rate.
-- `transcribe`: input role `audio`, result downloaded to `captions.srt`.
-- `assemble`: dynamic input roles `clip_1` through `clip_N`, `voiceover`, and
-  `captions`; 16fps clips pass through ffmpeg `minterpolate` to the configured
-  `fps_out`. If audio is longer, `tpad=stop_mode=clone` extends the final frame
-  through the complete voiceover (including its 0.5-second tail). The payload
-  explicitly forbids trimming audio or using shortest-stream termination.
+- `transcribe`: input role `audio`; faster-whisper JSON is converted locally
+  into two- or three-word ASS karaoke events using word-level timestamps.
+- `assemble`: dynamic input roles `clip_1` through `clip_N` and `voiceover`;
+  16fps clips pass through ffmpeg `minterpolate` to the configured `fps_out`.
+  If audio is longer, `tpad=stop_mode=clone` extends the final frame through
+  the complete voiceover (including its 0.5-second tail). The payload
+  explicitly forbids trimming audio or using shortest-stream termination. The
+  pipeline then burns the styled ASS track with ffmpeg's subtitles filter.
 
 Content-brief and script generation call the preset's OpenAI-compatible
 provider directly from the VPS. In local visual mode all five job types above
