@@ -149,6 +149,59 @@ class VisualJobTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
+    def test_comfyui_free_requests_model_unload_and_memory_release(self) -> None:
+        with mock.patch.object(
+            pipeline_worker,
+            "json_request",
+            return_value=(200, None),
+        ) as request:
+            self.processor.comfyui.free_memory()
+        request.assert_called_once_with(
+            "POST",
+            f"{self.config.comfyui_url}/free",
+            {"unload_models": True, "free_memory": True},
+            timeout=self.config.request_timeout,
+        )
+
+    def test_visual_memory_gate_frees_comfyui_and_retries(self) -> None:
+        with (
+            mock.patch.object(
+                self.processor,
+                "_mem_available_gb",
+                side_effect=[39.0, 42.5],
+            ) as available,
+            mock.patch.object(
+                self.processor.comfyui,
+                "free_memory",
+            ) as free_memory,
+            mock.patch.object(pipeline_worker.time, "sleep") as sleep,
+        ):
+            self.assertEqual(self.processor._require_visual_headroom(), 42.5)
+        self.assertEqual(available.call_count, 2)
+        free_memory.assert_called_once_with()
+        sleep.assert_called_once_with(pipeline_worker.COMFYUI_FREE_SETTLE_SECONDS)
+
+    def test_process_frees_comfyui_after_each_visual_job(self) -> None:
+        artifact = Path(self.temporary.name) / "artifact"
+        for job_type in ("frame", "video"):
+            with (
+                self.subTest(job_type=job_type),
+                mock.patch.object(
+                    self.processor,
+                    job_type,
+                    return_value=(artifact, {"type": job_type}),
+                ),
+                mock.patch.object(
+                    self.processor.comfyui,
+                    "free_memory",
+                ) as free_memory,
+            ):
+                self.processor.process(
+                    {"type": job_type, "payload": {}},
+                    Path(self.temporary.name),
+                )
+                free_memory.assert_called_once_with()
+
     def test_video_accepts_one_frame_aliases(self) -> None:
         for payload in (
             {"frame": "https://example.test/one.png"},

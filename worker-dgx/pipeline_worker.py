@@ -32,6 +32,7 @@ VISUAL_WORKFLOWS = (
     "wan22_i2v_api.json",
     "wan22_first_last_api.json",
 )
+COMFYUI_FREE_SETTLE_SECONDS = 2
 
 
 class PipelineError(RuntimeError):
@@ -486,6 +487,14 @@ class ComfyUIClient:
     def __init__(self, config: Config) -> None:
         self.config = config
 
+    def free_memory(self) -> None:
+        json_request(
+            "POST",
+            f"{self.config.comfyui_url}/free",
+            {"unload_models": True, "free_memory": True},
+            timeout=self.config.request_timeout,
+        )
+
     def probe(self) -> dict[str, Any]:
         try:
             _, body = json_request(
@@ -644,11 +653,23 @@ class JobProcessor:
             return self.transcribe(payload, work_dir)
         if job_type == "assemble":
             return self.assemble(payload, work_dir)
-        if job_type == "frame":
-            return self.frame(payload, work_dir)
-        if job_type == "video":
-            return self.video(payload, work_dir)
+        if job_type in {"frame", "video"}:
+            try:
+                handler = self.frame if job_type == "frame" else self.video
+                return handler(payload, work_dir)
+            finally:
+                self._free_comfyui_memory(f"after {job_type} job")
         raise PipelineError(f"Unsupported job type: {job_type}")
+
+    def _free_comfyui_memory(self, reason: str) -> None:
+        try:
+            self.comfyui.free_memory()
+        except PipelineError as exc:
+            LOG.warning(
+                "ComfyUI memory cleanup failed %s: %s",
+                reason,
+                compact_error(exc),
+            )
 
     @staticmethod
     def _inject_queue_inputs(
@@ -778,21 +799,34 @@ class JobProcessor:
             raise PipelineError("seed is outside the unsigned 64-bit range")
         return seed
 
-    def _require_visual_headroom(self) -> float:
+    @staticmethod
+    def _mem_available_gb() -> float:
         try:
             for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
                 if line.startswith("MemAvailable:"):
-                    available_gb = int(line.split()[1]) / 1024**2
-                    break
+                    return int(line.split()[1]) / 1024**2
             else:
                 raise ValueError("MemAvailable is missing")
         except (OSError, ValueError, IndexError) as exc:
             raise PipelineError(f"Cannot read UMA memory headroom: {exc}") from exc
+
+    def _require_visual_headroom(self) -> float:
         minimum = self.config.visual_min_available_gb
+        available_gb = self._mem_available_gb()
+        if available_gb < minimum:
+            LOG.warning(
+                "Visual job has %.1f GiB MemAvailable, below the %.1f GiB gate; "
+                "asking ComfyUI to unload cached models",
+                available_gb,
+                minimum,
+            )
+            self._free_comfyui_memory("before visual memory-gate retry")
+            time.sleep(COMFYUI_FREE_SETTLE_SECONDS)
+            available_gb = self._mem_available_gb()
         if available_gb < minimum:
             raise PipelineError(
                 f"Visual job requires {minimum:.1f} GiB MemAvailable; "
-                f"only {available_gb:.1f} GiB is available"
+                f"only {available_gb:.1f} GiB is available after ComfyUI cleanup"
             )
         return round(available_gb, 2)
 

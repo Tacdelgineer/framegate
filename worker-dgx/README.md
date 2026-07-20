@@ -110,8 +110,11 @@ read-only, and `comfyui/extra_model_paths.yaml` references the existing
 copy or download weights.
 
 The worker gates every visual job on `MemAvailable` from `/proc/meminfo`.
-`VISUAL_MIN_AVAILABLE_GB` defaults to 40. Ollama remains warm because the DGX
-has sufficient UMA headroom for Qwen and these visual workflows to coexist.
+`VISUAL_MIN_AVAILABLE_GB` defaults to 40. If the first check is below the gate,
+the worker asks ComfyUI to unload cached models and free memory, waits briefly,
+then checks `MemAvailable` again before rejecting the job. It also frees
+ComfyUI's cached models after every frame and video job. Ollama is never
+unloaded; Qwen remains warm by design.
 
 ## Configure the VPS address
 
