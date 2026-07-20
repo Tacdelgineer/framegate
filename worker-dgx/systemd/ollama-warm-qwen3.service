@@ -1,5 +1,5 @@
 [Unit]
-Description=Keep qwen3:8b resident in Ollama
+Description=Keep qwen3.6:35b-a3b resident in Ollama
 Requires=ollama.service
 Wants=tailscaled.service
 After=ollama.service tailscaled.service
