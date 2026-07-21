@@ -16,4 +16,11 @@ terminal:
   backend: local
   cwd: /home/alireza/content-factory
 
+gateway:
+  platforms:
+    telegram:
+      extra:
+        allow_from:
+          - "132490049"
+
 _config_version: 33

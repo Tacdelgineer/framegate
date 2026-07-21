@@ -205,17 +205,27 @@ Hermes Agent is a git installation at
 persona are `/home/alireza/.hermes/config.yaml` and
 `/home/alireza/.hermes/SOUL.md`.
 
-Two user services are installed:
+Four user services are installed:
 
 - `hermes-serve.service` runs `hermes serve` from
   `/home/alireza/hermes-workspace` on `100.123.208.90:9119`, loading
   `/home/alireza/.hermes/.env`.
 - `hermes-webui.service` runs `/home/alireza/hermes-webui/server.py` on
   `100.123.208.90:8788`.
+- `hermes-gateway.service` is Telegram Bot A. It runs the unqualified/default
+  profile from `/home/alireza/.hermes` and reads Bot A's token from
+  `/home/alireza/.hermes/.env`.
+- `hermes-gateway-factory-ops.service` is Telegram Bot B. It runs
+  `--profile factory-ops` from `/home/alireza/.hermes/profiles/factory-ops`
+  and reads Bot B's token from that profile's `.env`.
 
-The messaging gateway is a separate Hermes process and is not currently
-installed or running as a service. Telegram is not currently configured in
-`/home/alireza/.hermes/.env`.
+Both gateway units are user services, are enabled for `default.target`, and
+systemd linger is enabled for `alireza`, so they survive logout. Hermes
+generated the installed units; deployment snapshots live in
+`deploy/systemd/hermes-gateway.service` and
+`deploy/systemd/hermes-gateway-factory-ops.service`. An empty bot token leaves
+the service process running with `No messaging platforms enabled`; restart the
+corresponding unit after provisioning or rotating a token.
 
 Hermes profiles are isolated `HERMES_HOME` directories under
 `/home/alireza/.hermes/profiles/`. Each profile can have its own `config.yaml`,
@@ -284,33 +294,48 @@ under that profile.
 
 ### Selecting the profile in Telegram
 
-Telegram routing is location-based, not a user-issued profile switch.
-`/profile` only reports the profile serving the current chat; there is no
-`/profile factory-ops` command.
+Telegram routing is bot-based, not a user-issued profile switch. There is no
+`/profile factory-ops` command:
 
-The clean single-bot setup is a dedicated private Telegram group for pipeline
-operations. After a Telegram bot token and messaging gateway are configured,
-enable multiplexing in the default `/home/alireza/.hermes/config.yaml` and
-route that group's numeric `chat_id`:
+- Message Bot A for the general/default Hermes profile.
+- Message Bot B for the `factory-ops` pipeline operator.
 
-```yaml
-gateway:
-  multiplex_profiles: true
-  profile_routes:
-    - name: factory-ops-telegram
-      platform: telegram
-      chat_id: "<dedicated-private-group-chat-id>"
-      profile: factory-ops
+The two gateways are separate processes and do not use multiplexing or
+`profile_routes`. Send `/profile` to Bot A and Bot B after token provisioning;
+they must report `default` and `factory-ops`, respectively.
+
+Put the tokens in exactly these untracked, mode-`0600` files. Replace only the
+empty value after `TELEGRAM_BOT_TOKEN=`; never put both tokens in one file and
+never add either token to this repository:
+
+```bash
+# Bot A: default profile
+# /home/alireza/.hermes/.env
+TELEGRAM_BOT_TOKEN=<BOT_A_TOKEN_FROM_BOTFATHER>
+TELEGRAM_ALLOWED_USERS=132490049
+
+# Bot B: factory-ops profile
+# /home/alireza/.hermes/profiles/factory-ops/.env
+TELEGRAM_BOT_TOKEN=<BOT_B_TOKEN_FROM_BOTFATHER>
+TELEGRAM_ALLOWED_USERS=132490049
 ```
 
-Restart the messaging gateway after adding the route. The user selects
-`factory-ops` simply by messaging the bot in that dedicated group; messages to
-unmatched chats continue to use the default profile. Send `/profile` in the
-group to verify that Hermes reports `factory-ops`.
+Both profiles also pin `gateway.platforms.telegram.extra.allow_from` to
+`"132490049"`. `TELEGRAM_ALLOWED_USERS` covers DMs, groups, and forums, so all
+other Telegram user IDs are rejected. After inserting or rotating tokens:
 
-A single private DM with one bot has only one Telegram `chat_id`, so it cannot
-toggle profiles cleanly. If two separate one-to-one bot conversations are
-preferred, create a second Telegram bot token for `factory-ops`, place it only
-in `/home/alireza/.hermes/profiles/factory-ops/.env`, and run a separate
-`hermes -p factory-ops gateway` service. The original bot remains attached to
-the default profile.
+```bash
+chmod 600 /home/alireza/.hermes/.env \
+  /home/alireza/.hermes/profiles/factory-ops/.env
+systemctl --user restart hermes-gateway.service \
+  hermes-gateway-factory-ops.service
+systemctl --user is-active hermes-gateway.service \
+  hermes-gateway-factory-ops.service
+```
+
+Inspect connection failures without printing the configured token:
+
+```bash
+journalctl --user -u hermes-gateway.service \
+  -u hermes-gateway-factory-ops.service -n 100 --no-pager
+```
