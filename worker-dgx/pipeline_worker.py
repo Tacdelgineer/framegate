@@ -33,6 +33,11 @@ VISUAL_WORKFLOWS = (
     "wan22_i2v_api.json",
     "wan22_first_last_api.json",
 )
+VISUAL_MODEL_FAMILIES = {
+    "frame": "flux-frame",
+    "video": "wan-video",
+}
+VOICE_REFERENCE_ROOT = Path(__file__).resolve().parents[1] / "assets"
 COMFYUI_FREE_SETTLE_SECONDS = 2
 VIDEO_FPS = 16
 VIDEO_MAX_FRAME_COUNT = 129
@@ -656,12 +661,10 @@ class JobProcessor:
             return self.transcribe(payload, work_dir)
         if job_type == "assemble":
             return self.assemble(payload, work_dir)
-        if job_type in {"frame", "video"}:
-            try:
-                handler = self.frame if job_type == "frame" else self.video
-                return handler(payload, work_dir)
-            finally:
-                self._free_comfyui_memory(f"after {job_type} job")
+        if job_type == "frame":
+            return self.frame(payload, work_dir)
+        if job_type == "video":
+            return self.video(payload, work_dir)
         raise PipelineError(f"Unsupported job type: {job_type}")
 
     def _free_comfyui_memory(self, reason: str) -> None:
@@ -809,6 +812,16 @@ class JobProcessor:
             raise PipelineError(f"F5 reference must be under {asset_root}")
         relative = resolved.relative_to(asset_root)
         return str(Path("/app/data/assets") / relative)
+
+    def _stage_voice_reference(self, source: Path) -> Path:
+        destination_dir = self.config.asset_dir / "voice-references"
+        try:
+            destination_dir.mkdir(parents=True, exist_ok=True)
+            destination = destination_dir / f"{uuid.uuid4()}{source.suffix}"
+            shutil.copy2(source, destination)
+        except OSError as exc:
+            raise PipelineError(f"Cannot stage F5 voice reference: {exc}") from exc
+        return destination
 
     @staticmethod
     def _prompt(payload: dict[str, Any], job_type: str) -> str:
@@ -1134,20 +1147,48 @@ class JobProcessor:
             raise PipelineError("tts payload requires non-empty text")
         if len(text) > 20_000:
             raise PipelineError("tts text exceeds 20,000 characters")
-        ref_audio_url = payload.get("ref_audio_url")
-        ref_audio_path = payload.get("ref_audio_path")
-        if ref_audio_url:
+        uses_voice_ref = "voice_ref" in payload or "voice_ref_text" in payload
+        if uses_voice_ref:
+            voice_ref = payload.get("voice_ref")
+            voice_ref_text = payload.get("voice_ref_text")
+            if not isinstance(voice_ref, str) or not voice_ref.strip():
+                raise PipelineError(
+                    "tts voice_ref must be a non-empty path when voice_ref_text is set"
+                )
+            if not isinstance(voice_ref_text, str) or not voice_ref_text.strip():
+                raise PipelineError(
+                    "tts voice_ref_text must be non-empty when voice_ref is set"
+                )
+            if any(
+                payload.get(key)
+                for key in ("ref_audio_url", "ref_audio_path", "ref_text")
+            ):
+                raise PipelineError(
+                    "tts voice_ref/voice_ref_text cannot be combined with legacy "
+                    "reference fields"
+                )
+            source_ref = self._safe_existing_path(
+                voice_ref.strip(), VOICE_REFERENCE_ROOT
+            )
+            host_ref = self._stage_voice_reference(source_ref)
+            ref_text = voice_ref_text.strip()
+        elif payload.get("ref_audio_url"):
+            ref_audio_url = str(payload["ref_audio_url"])
             suffix = Path(urllib.parse.urlparse(str(ref_audio_url)).path).suffix or ".wav"
             host_ref = self.download(
-                str(ref_audio_url), self.config.asset_dir / f"{uuid.uuid4()}{suffix}"
+                ref_audio_url, self.config.asset_dir / f"{uuid.uuid4()}{suffix}"
             )
-        elif ref_audio_path:
-            host_ref = self._safe_existing_path(str(ref_audio_path), Path("/srv/ai/assets"))
+            ref_text = str(payload.get("ref_text") or self.config.default_ref_text)
+        elif payload.get("ref_audio_path"):
+            host_ref = self._safe_existing_path(
+                str(payload["ref_audio_path"]), Path("/srv/ai/assets")
+            )
+            ref_text = str(payload.get("ref_text") or self.config.default_ref_text)
         else:
             host_ref = self._safe_existing_path(
                 self.config.default_ref_audio, Path("/srv/ai/assets")
             )
-        ref_text = str(payload.get("ref_text") or self.config.default_ref_text)
+            ref_text = self.config.default_ref_text
         speed = float(payload.get("speed", 1.0))
         if not 0.5 <= speed <= 2.0:
             raise PipelineError("tts speed must be between 0.5 and 2.0")
@@ -1484,6 +1525,7 @@ class Worker:
         self.state_lock = threading.Lock()
         self.stop_event = threading.Event()
         self.health_server: http.server.ThreadingHTTPServer | None = None
+        self.cached_model_family: str | None = None
 
     def prepare(self) -> None:
         try:
@@ -1600,6 +1642,7 @@ class Worker:
             self.state.current_job_id = job_id
             self.state.current_job_type = job_type
             self.state.last_error = None
+        self._prepare_model_cache(job_id, job_type)
         LOG.info("Claimed job %s (%s)", job_id, job_type)
 
         last_error = "unknown error"
@@ -1648,6 +1691,35 @@ class Worker:
             self.state.current_job_id = None
             self.state.current_job_type = None
             self.state.current_attempt = None
+
+    def _prepare_model_cache(self, job_id: str, job_type: str) -> str:
+        next_family = VISUAL_MODEL_FAMILIES.get(job_type)
+        previous_family = self.cached_model_family
+        if previous_family is not None and previous_family != next_family:
+            self.processor._free_comfyui_memory(
+                f"on model-family transition {previous_family} to "
+                f"{next_family or 'non-visual'}"
+            )
+            self.cached_model_family = None
+
+        if next_family is None:
+            LOG.info(
+                "Model cache job=%s type=%s family=none state=not-applicable",
+                job_id,
+                job_type,
+            )
+            return "not-applicable"
+
+        cache_state = "cached" if previous_family == next_family else "load"
+        self.cached_model_family = next_family
+        LOG.info(
+            "Model cache job=%s type=%s family=%s state=%s",
+            job_id,
+            job_type,
+            next_family,
+            cache_state,
+        )
+        return cache_state
 
     def health_snapshot(self) -> dict[str, Any]:
         memory = self._unified_memory()

@@ -62,6 +62,13 @@ XAI_VIDEO_CREATE_URL = "https://api.x.ai/v1/videos/generations"
 XAI_VIDEO_STATUS_URL = "https://api.x.ai/v1/videos/{request_id}"
 OPENAI_IMAGE_URL = "https://api.openai.com/v1/images/generations"
 
+VOICE_PRESETS = {
+    "alireza": {
+        "ref_audio": "/home/xxfactionsxx/content-factory/assets/alireza.wav",
+        "ref_text_file": MONOREPO_ROOT / "assets" / "alireza.txt",
+    },
+}
+
 
 def utc_now() -> str:
     return datetime.now(UTC).isoformat()
@@ -159,6 +166,7 @@ class Settings:
     telegram_chat_id: str
     telegram_poll_timeout: int
     approval_wait_timeout: float
+    voice_preset: str
 
     @classmethod
     def from_environment(
@@ -202,6 +210,7 @@ class Settings:
             approval_wait_timeout=float(
                 os.getenv("APPROVAL_WAIT_TIMEOUT", "0")
             ),
+            voice_preset=os.getenv("TTS_VOICE_PRESET", "alireza").strip(),
         )
 
 
@@ -924,6 +933,7 @@ Requirements:
         voiceover_text = "\n\n".join(
             str(shot["voiceover_text"]).strip() for shot in shots
         )
+        voice_reference = self._voice_reference_payload()
         self._queue_job(
             "tts",
             "tts",
@@ -939,6 +949,7 @@ Requirements:
                 ],
                 "target_duration_seconds": 50,
                 "output_format": "wav",
+                **voice_reference,
             },
             {},
             voiceover_path,
@@ -961,6 +972,30 @@ Requirements:
             captions_path=str(captions_path),
             last_error=None,
         )
+
+    def _voice_reference_payload(self) -> dict[str, str]:
+        preset_name = self.settings.voice_preset
+        preset = VOICE_PRESETS.get(preset_name)
+        if preset is None:
+            raise ValueError(
+                f"Unknown TTS_VOICE_PRESET {preset_name!r}; "
+                f"choose one of {sorted(VOICE_PRESETS)}"
+            )
+        transcript_path = Path(preset["ref_text_file"])
+        try:
+            transcript = transcript_path.read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            raise ValueError(
+                f"Cannot read voice preset transcript {transcript_path}: {exc}"
+            ) from exc
+        if not transcript:
+            raise ValueError(
+                f"Voice preset transcript is empty: {transcript_path}"
+            )
+        return {
+            "voice_ref": str(preset["ref_audio"]),
+            "voice_ref_text": transcript,
+        }
 
     def assemble(self) -> None:
         row = self.current()

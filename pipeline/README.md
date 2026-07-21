@@ -50,7 +50,8 @@ deletes generated media, rewinds to `scripted`, and reruns frames onward.
 ## DGX queue jobs
 
 - `tts`: payload contains the combined narration and five timed shot entries;
-  result is downloaded to `voiceover.wav`.
+  result is downloaded to `voiceover.wav`. The selected `TTS_VOICE_PRESET`
+  adds the worker contract fields `voice_ref` and `voice_ref_text`.
 - `transcribe`: input role `audio`, result downloaded to `captions.srt`.
 - `assemble`: input roles `clip_1` through `clip_5`, `voiceover`, and
   `captions`; result downloaded to `final.mp4`.
@@ -60,6 +61,13 @@ jobs above are sent to the queue.
 
 The queue client is imported from the sibling `../queue` directory by default.
 `JOB_QUEUE_CLIENT_ROOT` can override that location for development.
+
+Voice presets are declared in `news_pipeline.py` as `VOICE_PRESETS` blocks with
+`ref_audio` (the absolute DGX worker asset path) and `ref_text_file` (the
+checked-in transcript read by the pipeline). `TTS_VOICE_PRESET` defaults to
+`alireza`. After this change is deployed, the VPS only needs a `git pull`; the
+pipeline is invoked fresh for each run, so no additional service restart is
+required.
 
 ## Approval
 

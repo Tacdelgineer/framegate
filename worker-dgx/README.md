@@ -105,9 +105,28 @@ worker clone-pads the last video frame with `tpad` before applying
 short visual stream. The worker injects each queue-provided `download_url`
 into the handler payload after claiming.
 
-TTS also accepts `ref_audio_url`, `ref_audio_path` (restricted to
-`/srv/ai/assets`), and `ref_text`. Text-only jobs use the configured Narrator
-voice profile.
+TTS accepts optional zero-shot voice cloning through `voice_ref` and
+`voice_ref_text`:
+
+```json
+{
+  "type": "tts",
+  "payload": {
+    "text": "This uses the selected cloned voice.",
+    "voice_ref": "/home/xxfactionsxx/content-factory/assets/alireza.wav",
+    "voice_ref_text": "The exact transcript spoken in alireza.wav."
+  }
+}
+```
+
+Both fields must be supplied together. `voice_ref` must resolve to an existing
+file under `/home/xxfactionsxx/content-factory/assets`; paths elsewhere and
+symlinks escaping that directory are rejected. The worker stages the validated
+audio into F5-TTS's mounted asset directory and passes it with
+`voice_ref_text` as the F5 reference. When both fields are absent, the existing
+configured Narrator voice remains the default. Legacy `ref_audio_url`,
+`ref_audio_path` (restricted to `/srv/ai/assets`), and `ref_text` remain
+supported, but cannot be combined with the new fields.
 
 ## ComfyUI service and models
 
@@ -127,8 +146,12 @@ copy or download weights.
 The worker gates every visual job on `MemAvailable` from `/proc/meminfo`.
 `VISUAL_MIN_AVAILABLE_GB` defaults to 40. If the first check is below the gate,
 the worker asks ComfyUI to unload cached models and free memory, waits briefly,
-then checks `MemAvailable` again before rejecting the job. It also frees
-ComfyUI's cached models after every frame and video job. Ollama is never
+then checks `MemAvailable` again before rejecting the job. After a successful
+visual job, the worker retains the ComfyUI model and reuses it when the next
+claimed job has the same family (`flux-frame` or `wan-video`). It calls
+ComfyUI `/free` when the next claimed job changes families or is non-visual.
+Each claimed job logs its model family and `state=load`, `state=cached`, or
+`state=not-applicable` so cache impact can be measured. Ollama is never
 unloaded; Qwen remains warm by design.
 
 ## Configure the VPS address

@@ -131,6 +131,123 @@ class QueueTests(unittest.TestCase):
         self.assertIn("status=done", args)
 
 
+class VoiceJobTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        root = Path(self.temporary.name)
+        self.config = dataclasses.replace(
+            pipeline_worker.Config.from_env(),
+            output_dir=root / "outputs",
+        )
+        self.config.output_dir.mkdir()
+        self.processor = pipeline_worker.JobProcessor(self.config)
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def test_voice_clone_requires_both_contract_fields(self) -> None:
+        valid_ref = pipeline_worker.VOICE_REFERENCE_ROOT / "alireza.wav"
+        for payload, message in (
+            ({"text": "Hello", "voice_ref": str(valid_ref)}, "voice_ref_text"),
+            ({"text": "Hello", "voice_ref_text": "Transcript"}, "voice_ref"),
+        ):
+            with self.subTest(payload=payload):
+                with self.assertRaisesRegex(pipeline_worker.PipelineError, message):
+                    self.processor.tts(payload, Path(self.temporary.name))
+
+    def test_voice_clone_rejects_paths_outside_repository_assets(self) -> None:
+        outside = Path(self.temporary.name) / "outside.wav"
+        outside.write_bytes(b"audio")
+        with self.assertRaisesRegex(
+            pipeline_worker.PipelineError,
+            "Local path must be under",
+        ):
+            self.processor.tts(
+                {
+                    "text": "Hello",
+                    "voice_ref": str(outside),
+                    "voice_ref_text": "Transcript",
+                },
+                Path(self.temporary.name),
+            )
+
+    def test_voice_clone_stages_valid_reference_and_passes_transcript(self) -> None:
+        output = self.config.output_dir / "clone.wav"
+        output.write_bytes(b"audio")
+        source = pipeline_worker.VOICE_REFERENCE_ROOT / "alireza.wav"
+        staged = Path("/srv/ai/assets/pipeline-worker/voice-references/clone.wav")
+        with (
+            mock.patch.object(
+                self.processor,
+                "_stage_voice_reference",
+                return_value=staged,
+            ) as stage,
+            mock.patch.object(
+                self.processor.f5tts,
+                "ensure_started",
+                return_value="http://f5tts.test:8000",
+            ),
+            mock.patch.object(
+                pipeline_worker,
+                "json_request",
+                return_value=(200, {"output_path": output.name}),
+            ) as request,
+        ):
+            artifact, _ = self.processor.tts(
+                {
+                    "text": "Clone this voice.",
+                    "voice_ref": str(source),
+                    "voice_ref_text": "Reference transcript.",
+                },
+                Path(self.temporary.name),
+            )
+        self.assertEqual(artifact, output)
+        stage.assert_called_once_with(source.resolve())
+        self.assertEqual(
+            request.call_args.args[2],
+            {
+                "text": "Clone this voice.",
+                "ref_audio_path": (
+                    "/app/data/assets/pipeline-worker/"
+                    "voice-references/clone.wav"
+                ),
+                "ref_text": "Reference transcript.",
+                "speed": 1.0,
+            },
+        )
+
+    def test_voice_contract_absence_keeps_default_voice(self) -> None:
+        output = self.config.output_dir / "default.wav"
+        output.write_bytes(b"audio")
+        default_ref = Path(self.config.default_ref_audio)
+        with (
+            mock.patch.object(
+                self.processor,
+                "_safe_existing_path",
+                return_value=default_ref,
+            ),
+            mock.patch.object(
+                self.processor.f5tts,
+                "ensure_started",
+                return_value="http://f5tts.test:8000",
+            ),
+            mock.patch.object(
+                pipeline_worker,
+                "json_request",
+                return_value=(200, {"output_path": output.name}),
+            ) as request,
+        ):
+            self.processor.tts(
+                {"text": "Use the default voice."},
+                Path(self.temporary.name),
+            )
+        self.assertEqual(request.call_args.args[2]["ref_text"], self.config.default_ref_text)
+        self.assertEqual(
+            request.call_args.args[2]["ref_audio_path"],
+            self.processor._container_asset_path(default_ref),
+        )
+
+
 class VisualJobTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -181,7 +298,7 @@ class VisualJobTests(unittest.TestCase):
         free_memory.assert_called_once_with()
         sleep.assert_called_once_with(pipeline_worker.COMFYUI_FREE_SETTLE_SECONDS)
 
-    def test_process_frees_comfyui_after_each_visual_job(self) -> None:
+    def test_process_leaves_visual_model_cleanup_to_worker_cache(self) -> None:
         artifact = Path(self.temporary.name) / "artifact"
         for job_type in ("frame", "video"):
             with (
@@ -200,7 +317,7 @@ class VisualJobTests(unittest.TestCase):
                     {"type": job_type, "payload": {}},
                     Path(self.temporary.name),
                 )
-                free_memory.assert_called_once_with()
+                free_memory.assert_not_called()
 
     def test_video_accepts_one_frame_aliases(self) -> None:
         for payload in (
@@ -507,6 +624,50 @@ class VisualJobTests(unittest.TestCase):
             with self.subTest(filename=filename):
                 graph = self.processor.comfyui.load_workflow(filename)
                 self.assertIn(expected, {node["class_type"] for node in graph.values()})
+
+
+class WorkerModelCacheTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.worker = pipeline_worker.Worker(pipeline_worker.Config.from_env())
+
+    def test_same_family_is_cached_without_free(self) -> None:
+        with (
+            mock.patch.object(
+                self.worker.processor,
+                "_free_comfyui_memory",
+            ) as free_memory,
+            self.assertLogs("pipeline-worker", level="INFO") as logs,
+        ):
+            self.assertEqual(
+                self.worker._prepare_model_cache("frame-1", "frame"),
+                "load",
+            )
+            self.assertEqual(
+                self.worker._prepare_model_cache("frame-2", "frame"),
+                "cached",
+            )
+        free_memory.assert_not_called()
+        self.assertIn("family=flux-frame state=load", logs.output[0])
+        self.assertIn("family=flux-frame state=cached", logs.output[1])
+
+    def test_family_transitions_free_cached_model(self) -> None:
+        with mock.patch.object(
+            self.worker.processor,
+            "_free_comfyui_memory",
+        ) as free_memory:
+            self.worker._prepare_model_cache("frame-1", "frame")
+            self.worker._prepare_model_cache("video-1", "video")
+            self.worker._prepare_model_cache("tts-1", "tts")
+        self.assertEqual(free_memory.call_count, 2)
+        self.assertIn(
+            "flux-frame to wan-video",
+            free_memory.call_args_list[0].args[0],
+        )
+        self.assertIn(
+            "wan-video to non-visual",
+            free_memory.call_args_list[1].args[0],
+        )
+        self.assertIsNone(self.worker.cached_model_family)
 
 
 if __name__ == "__main__":

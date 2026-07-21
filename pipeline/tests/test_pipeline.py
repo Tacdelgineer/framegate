@@ -65,6 +65,7 @@ def settings(tmp_path: Path) -> module.Settings:
         telegram_chat_id="123",
         telegram_poll_timeout=1,
         approval_wait_timeout=1,
+        voice_preset="alireza",
     )
 
 
@@ -340,6 +341,12 @@ def test_queue_media_stages_use_required_job_types_and_roles(
         "transcribe",
         "assemble",
     ]
+    assert queue.submissions[0]["payload"]["voice_ref"] == (
+        "/home/xxfactionsxx/content-factory/assets/alireza.wav"
+    )
+    assert queue.submissions[0]["payload"]["voice_ref_text"] == (
+        module.MONOREPO_ROOT / "assets" / "alireza.txt"
+    ).read_text(encoding="utf-8").strip()
     assert set(queue.submissions[1]["input_files"]) == {"audio"}
     assert set(queue.submissions[2]["input_files"]) == {
         "clip_1",
