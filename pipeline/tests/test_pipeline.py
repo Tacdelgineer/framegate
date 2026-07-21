@@ -1492,10 +1492,10 @@ def test_video_job_builder_matches_worker_contract(
     assert worker.JobProcessor._video_frame_urls(worker_payload) == [
         item["download_url"] for item in queue_files
     ]
+    assert worker.VIDEO_FPS == module.WAN_FPS == 16
     assert worker.JobProcessor._video_timing(worker_payload) == (
-        expected_frame_count / module.WAN_FPS,
-        16,
         expected_frame_count,
+        expected_frame_count / module.WAN_FPS,
     )
 
 
