@@ -31,3 +31,5 @@ caption_style:
   # Percent of frame height above the bottom edge; 20 keeps captions UI-safe.
   position: 20
 narration_style: "Conversational, curious, direct, and warm."
+# Use "default" for the worker's stock voice, or a named VOICE_PRESETS entry.
+voice: narrator

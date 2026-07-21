@@ -146,7 +146,7 @@ class VoiceJobTests(unittest.TestCase):
         self.temporary.cleanup()
 
     def test_voice_clone_requires_both_contract_fields(self) -> None:
-        valid_ref = pipeline_worker.VOICE_REFERENCE_ROOT / "alireza.wav"
+        valid_ref = pipeline_worker.VOICE_REFERENCE_ROOT / "narrator.wav"
         for payload, message in (
             ({"text": "Hello", "voice_ref": str(valid_ref)}, "voice_ref_text"),
             ({"text": "Hello", "voice_ref_text": "Transcript"}, "voice_ref"),
@@ -174,9 +174,14 @@ class VoiceJobTests(unittest.TestCase):
     def test_voice_clone_stages_valid_reference_and_passes_transcript(self) -> None:
         output = self.config.output_dir / "clone.wav"
         output.write_bytes(b"audio")
-        source = pipeline_worker.VOICE_REFERENCE_ROOT / "alireza.wav"
+        source = pipeline_worker.VOICE_REFERENCE_ROOT / "narrator.wav"
         staged = Path("/srv/ai/assets/pipeline-worker/voice-references/clone.wav")
         with (
+            mock.patch.object(
+                self.processor,
+                "_safe_existing_path",
+                return_value=source.resolve(),
+            ),
             mock.patch.object(
                 self.processor,
                 "_stage_voice_reference",
@@ -215,6 +220,19 @@ class VoiceJobTests(unittest.TestCase):
                 "speed": 1.0,
             },
         )
+
+    def test_missing_clone_audio_error_includes_worker_path(self) -> None:
+        missing = pipeline_worker.VOICE_REFERENCE_ROOT / "narrator-missing.wav"
+        with self.assertRaises(pipeline_worker.PipelineError) as caught:
+            self.processor.tts(
+                {
+                    "text": "Hello",
+                    "voice_ref": str(missing),
+                    "voice_ref_text": "Reference transcript.",
+                },
+                Path(self.temporary.name),
+            )
+        self.assertIn(str(missing.resolve()), str(caught.exception))
 
     def test_voice_contract_absence_keeps_default_voice(self) -> None:
         output = self.config.output_dir / "default.wav"

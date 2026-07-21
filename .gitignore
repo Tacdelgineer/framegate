@@ -13,6 +13,9 @@
 *.wav
 *.mp4
 *.log
+# Personal cloned-voice references are provisioned out of band, never committed.
+/assets/*.wav
+/assets/*.txt
 queue/data/
 pipeline/data/
 pipeline/runs/*

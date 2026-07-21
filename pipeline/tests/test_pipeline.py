@@ -145,7 +145,6 @@ def settings(tmp_path: Path) -> module.Settings:
         telegram_chat_id="123",
         telegram_poll_timeout=1,
         approval_wait_timeout=1,
-        voice_preset="alireza",
     )
 
 
@@ -920,6 +919,18 @@ def test_queue_media_stages_use_required_job_types_and_roles(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    transcript_path = tmp_path / "narrator.txt"
+    transcript_path.write_text("Reference transcript.", encoding="utf-8")
+    monkeypatch.setitem(
+        module.VOICE_PRESETS,
+        "narrator",
+        {
+            "worker_audio_path": (
+                "/home/xxfactionsxx/content-factory/assets/narrator.wav"
+            ),
+            "local_transcript_path": transcript_path,
+        },
+    )
     monkeypatch.setattr(
         module,
         "burn_ass_subtitles",
@@ -950,7 +961,13 @@ def test_queue_media_stages_use_required_job_types_and_roles(
         clips_json=json.dumps(clips),
     )
     queue = RecordingQueue()
-    pipeline = module.NewsPipeline(config, store, run, queue_client=queue)
+    pipeline = module.NewsPipeline(
+        config,
+        store,
+        run,
+        config=module.PipelineConfig(voice="narrator"),
+        queue_client=queue,
+    )
     try:
         pipeline.generate_voiceover_and_captions()
         pipeline.assemble()
@@ -963,11 +980,11 @@ def test_queue_media_stages_use_required_job_types_and_roles(
         "assemble",
     ]
     assert queue.submissions[0]["payload"]["voice_ref"] == (
-        "/home/xxfactionsxx/content-factory/assets/alireza.wav"
+        "/home/xxfactionsxx/content-factory/assets/narrator.wav"
     )
     assert queue.submissions[0]["payload"]["voice_ref_text"] == (
-        module.MONOREPO_ROOT / "assets" / "alireza.txt"
-    ).read_text(encoding="utf-8").strip()
+        "Reference transcript."
+    )
     assert set(queue.submissions[5]["input_files"]) == {"audio"}
     assert set(queue.submissions[6]["input_files"]) == {
         "clip_1",
@@ -1176,8 +1193,49 @@ def test_default_preset_loads_and_cli_defaults_local() -> None:
         position=20,
     )
     assert preset.narration_style == "Conversational, curious, direct, and warm."
+    assert preset.voice == "narrator"
     assert args.visuals == "local"
     assert args.frame_gate is True
+
+
+def test_voice_config_accepts_stock_and_named_voices() -> None:
+    assert module.PipelineConfig(voice="default").to_dict()["voice"] == "default"
+    assert module.PipelineConfig(voice="narrator").to_dict()["voice"] == "narrator"
+    with pytest.raises(ValueError, match="voice must be one of"):
+        module.PipelineConfig(voice="unknown").validate()
+
+
+def test_stock_voice_omits_clone_contract_fields() -> None:
+    assert module.voice_reference_payload("default") == {}
+
+
+def test_clone_voice_startup_requires_local_transcript(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transcript_path = tmp_path / "missing-narrator.txt"
+    worker_audio_path = "/dgx/content-factory/assets/narrator.wav"
+    monkeypatch.setitem(
+        module.VOICE_PRESETS,
+        "narrator",
+        {
+            "worker_audio_path": worker_audio_path,
+            "local_transcript_path": transcript_path,
+        },
+    )
+
+    with pytest.raises(RuntimeError) as caught:
+        module.validate_startup(
+            settings(tmp_path),
+            "local",
+            module.PipelineConfig(voice="narrator"),
+        )
+
+    message = str(caught.value)
+    assert "Cloned voice 'narrator' requires the local transcript" in message
+    assert str(transcript_path) in message
+    assert worker_audio_path in message
+    assert "before starting the run" in message
 
 
 def test_status_interfaces_report_sqlite_state_read_only(
@@ -1762,6 +1820,7 @@ def test_run_configuration_is_snapshotted_for_resume(tmp_path: Path) -> None:
         ),
         style_block="FIRST ",
         fps_out=30,
+        voice="narrator",
     )
     run, _, visuals, frame_gate = module.configure_run(
         store,
@@ -1785,6 +1844,7 @@ def test_run_configuration_is_snapshotted_for_resume(tmp_path: Path) -> None:
     assert resumed.script_provider.base_url == "https://api.openai.com/v1"
     assert resumed.script_provider.model == "openai-test"
     assert resumed.script_provider.api_key_env == "OPENAI_API_KEY"
+    assert resumed.voice == "narrator"
     assert resumed_visuals == "local"
     assert resumed_gate is False
 

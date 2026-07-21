@@ -82,11 +82,12 @@ DEFAULT_NARRATION_STYLE = "Conversational, curious, direct, and warm."
 DEFAULT_SCRIPT_BASE_URL = "http://100.103.129.82:11434/v1"
 DEFAULT_SCRIPT_MODEL = "qwen3.6:35b-a3b"
 DEFAULT_SCRIPT_TIMEOUT_SECONDS = 900.0
+DEFAULT_VOICE = "default"
 
 VOICE_PRESETS = {
-    "alireza": {
-        "ref_audio": "/home/xxfactionsxx/content-factory/assets/alireza.wav",
-        "ref_text_file": MONOREPO_ROOT / "assets" / "alireza.txt",
+    "narrator": {
+        "worker_audio_path": ("/home/xxfactionsxx/content-factory/assets/narrator.wav"),
+        "local_transcript_path": MONOREPO_ROOT / "assets" / "narrator.txt",
     },
 }
 
@@ -104,6 +105,37 @@ def new_seed(previous: int | None = None) -> int:
 
 def valid_file(path: str | Path | None) -> bool:
     return bool(path) and Path(path).is_file() and Path(path).stat().st_size > 0
+
+
+def voice_reference_payload(voice: str) -> dict[str, str]:
+    if voice == DEFAULT_VOICE:
+        return {}
+    preset = VOICE_PRESETS.get(voice)
+    if preset is None:
+        choices = ", ".join(repr(name) for name in [DEFAULT_VOICE, *VOICE_PRESETS])
+        raise ValueError(f"voice must be one of: {choices}")
+    transcript_path = Path(preset["local_transcript_path"])
+    worker_audio_path = str(preset["worker_audio_path"])
+    try:
+        transcript = transcript_path.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise RuntimeError(
+            f"Cloned voice {voice!r} requires the local transcript "
+            f"{transcript_path}, but it cannot be read: {exc}. Provision the "
+            "gitignored transcript before starting the run. The DGX worker "
+            f"audio must be provisioned separately at {worker_audio_path}."
+        ) from exc
+    if not transcript:
+        raise RuntimeError(
+            f"Cloned voice {voice!r} has an empty local transcript: "
+            f"{transcript_path}. Provision a non-empty gitignored transcript "
+            "before starting the run. The DGX worker audio must be provisioned "
+            f"separately at {worker_audio_path}."
+        )
+    return {
+        "voice_ref": worker_audio_path,
+        "voice_ref_text": transcript,
+    }
 
 
 def json_load(raw: str | None, fallback: Any) -> Any:
@@ -509,6 +541,7 @@ class PipelineConfig:
     fps_out: int = 30
     caption_style: CaptionStyleConfig = field(default_factory=CaptionStyleConfig)
     narration_style: str = DEFAULT_NARRATION_STYLE
+    voice: str = DEFAULT_VOICE
 
     @classmethod
     def from_mapping(cls, values: Mapping[str, Any]) -> "PipelineConfig":
@@ -538,6 +571,7 @@ class PipelineConfig:
             fps_out=merged["fps_out"],
             caption_style=CaptionStyleConfig.from_mapping(raw_caption_style),
             narration_style=merged["narration_style"],
+            voice=merged["voice"],
         )
         config.validate()
         return config
@@ -564,6 +598,12 @@ class PipelineConfig:
             raise ValueError("negative_prompt must be a string")
         if not isinstance(self.narration_style, str):
             raise ValueError("narration_style must be a string")
+        if not isinstance(self.voice, str) or self.voice not in {
+            DEFAULT_VOICE,
+            *VOICE_PRESETS,
+        }:
+            choices = ", ".join(repr(name) for name in [DEFAULT_VOICE, *VOICE_PRESETS])
+            raise ValueError(f"voice must be one of: {choices}")
         if self.video_mode not in VIDEO_MODES:
             raise ValueError(
                 "video_mode must be one of: " + ", ".join(sorted(VIDEO_MODES))
@@ -605,6 +645,7 @@ class PipelineConfig:
             "fps_out": self.fps_out,
             "caption_style": self.caption_style.to_dict(),
             "narration_style": self.narration_style,
+            "voice": self.voice,
         }
 
 
@@ -865,7 +906,6 @@ class Settings:
     telegram_chat_id: str
     telegram_poll_timeout: int
     approval_wait_timeout: float
-    voice_preset: str
 
     @classmethod
     def from_environment(
@@ -905,10 +945,7 @@ class Settings:
                 or os.getenv("TELEGRAM_DEFAULT_CHAT_ID", "")
             ),
             telegram_poll_timeout=int(os.getenv("TELEGRAM_POLL_TIMEOUT", "25")),
-            approval_wait_timeout=float(
-                os.getenv("APPROVAL_WAIT_TIMEOUT", "0")
-            ),
-            voice_preset=os.getenv("TTS_VOICE_PRESET", "alireza").strip(),
+            approval_wait_timeout=float(os.getenv("APPROVAL_WAIT_TIMEOUT", "0")),
         )
 
 
@@ -2458,28 +2495,7 @@ Return exactly:
         )
 
     def _voice_reference_payload(self) -> dict[str, str]:
-        preset_name = self.settings.voice_preset
-        preset = VOICE_PRESETS.get(preset_name)
-        if preset is None:
-            raise ValueError(
-                f"Unknown TTS_VOICE_PRESET {preset_name!r}; "
-                f"choose one of {sorted(VOICE_PRESETS)}"
-            )
-        transcript_path = Path(preset["ref_text_file"])
-        try:
-            transcript = transcript_path.read_text(encoding="utf-8").strip()
-        except OSError as exc:
-            raise ValueError(
-                f"Cannot read voice preset transcript {transcript_path}: {exc}"
-            ) from exc
-        if not transcript:
-            raise ValueError(
-                f"Voice preset transcript is empty: {transcript_path}"
-            )
-        return {
-            "voice_ref": str(preset["ref_audio"]),
-            "voice_ref_text": transcript,
-        }
+        return voice_reference_payload(self.config.voice)
 
     def assemble(self) -> None:
         row = self.current()
@@ -3473,6 +3489,7 @@ def validate_startup(
     visuals: str,
     config: PipelineConfig,
 ) -> None:
+    voice_reference_payload(config.voice)
     provider = config.script_provider
     if provider.api_key_env and not script_provider_api_key(settings, provider):
         raise RuntimeError(

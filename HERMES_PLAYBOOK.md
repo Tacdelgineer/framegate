@@ -133,10 +133,12 @@ Limit changes to `script_provider.base_url`, `script_provider.model`,
 `negative_prompt`; `caption_style.captions_enabled`,
 `caption_style.font_size`, `caption_style.base_color`,
 `caption_style.highlight_color`, `caption_style.position`; and
-`narration_style`. Caption colors use `#RRGGBB`; caption position is the percent
-of frame height above the bottom edge. The script provider is independent of
-`--visuals`; changing one never implies changing the other. Use `api_key_env:
-null` for keyless Ollama, `XAI_API_KEY` for xAI, or `OPENAI_API_KEY` for OpenAI.
+`narration_style`; and `voice`. Set `voice` to `default` for the worker's stock
+voice or to a named cloned-voice registry entry. Caption colors use `#RRGGBB`;
+caption position is the percent of frame height above the bottom edge. The
+script provider is independent of `--visuals`; changing one never implies
+changing the other. Use `api_key_env: null` for keyless Ollama, `XAI_API_KEY`
+for xAI, or `OPENAI_API_KEY` for OpenAI.
 
 1. Read `/home/alireza/content-factory/config/presets.yaml`.
 2. Prepare a before/after unified diff without writing any file.

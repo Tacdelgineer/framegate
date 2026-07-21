@@ -48,7 +48,8 @@ workflow, I2V/first-last-frame selection, resolution, draft/final steps,
 negative prompt, output FPS, and the independent OpenAI-compatible
 `script_provider`. The free-text `narration_style` is injected into the script
 prompt. `caption_style` controls caption enablement, size, base/highlight
-colors, and vertical position.
+colors, and vertical position. `voice` selects `default` for the worker's stock
+voice or a named cloned-voice entry such as `narrator`.
 
 The script prompt requests enough 4–6-second narration shots to fill
 `target_duration_seconds` (nine shots at the 45-second default). TTS runs once
@@ -91,10 +92,10 @@ only that frame. Final-video Regenerate deletes generated media, rewinds to
 - `frame`: no input files; payload contains the configured worker workflow,
   prompt, negative prompt, resolution, draft steps, and seed.
 - `tts`: one job per shot; payload contains that shot's narration, shot index,
-  target duration, and the selected `TTS_VOICE_PRESET` contract fields
-  `voice_ref` and `voice_ref_text`. Each result is stored under `voiceover/`
-  and all active results are joined into `voiceover.wav` with 0.5 seconds of
-  silent tail room.
+  and target duration. Named cloned voices also include `voice_ref` with the
+  worker-side audio path and `voice_ref_text` with the local transcript. Each
+  result is stored under `voiceover/` and all active results are joined into
+  `voiceover.wav` with 0.5 seconds of silent tail room.
 - `video`: input role `start_frame` for I2V, followed by `end_frame` for
   first/last-frame mode. The queue client uploads those as
   `input:start_frame` and optional `input:end_frame`; payload contains the
@@ -118,11 +119,13 @@ The queue client is imported from the sibling `../queue` directory by default.
 `JOB_QUEUE_CLIENT_ROOT` can override that location for development.
 
 Voice presets are declared in `news_pipeline.py` as `VOICE_PRESETS` blocks with
-`ref_audio` (the absolute DGX worker asset path) and `ref_text_file` (the
-checked-in transcript read by the pipeline). `TTS_VOICE_PRESET` defaults to
-`alireza`. After this change is deployed, the VPS only needs a `git pull`; the
-pipeline is invoked fresh for each run, so no additional service restart is
-required.
+`worker_audio_path` (the absolute DGX worker asset path) and
+`local_transcript_path` (the VPS transcript read at startup). Both reference
+assets are gitignored and must be provisioned out of band. A missing local
+transcript stops a cloned-voice run before API or queue activity; a missing DGX
+audio file is reported by the worker using the exact `voice_ref` path from the
+job. The pipeline is invoked fresh for each run, so no service restart is
+required after code or preset deployment.
 
 ## Approval
 

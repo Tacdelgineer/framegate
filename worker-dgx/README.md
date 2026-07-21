@@ -133,8 +133,8 @@ TTS accepts optional zero-shot voice cloning through `voice_ref` and
   "type": "tts",
   "payload": {
     "text": "This uses the selected cloned voice.",
-    "voice_ref": "/home/xxfactionsxx/content-factory/assets/alireza.wav",
-    "voice_ref_text": "The exact transcript spoken in alireza.wav."
+    "voice_ref": "/home/xxfactionsxx/content-factory/assets/narrator.wav",
+    "voice_ref_text": "The exact transcript spoken in narrator.wav."
   }
 }
 ```
