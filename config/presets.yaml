@@ -1,21 +1,32 @@
 # Pipeline-wide script, visual, and render defaults. Changes apply to new runs;
 # each run snapshots these values so a restart cannot silently change its output.
 #
-# OpenAI-compatible hosted alternatives use base_url https://api.x.ai/v1 with
-# api_key_env XAI_API_KEY, or base_url https://api.openai.com/v1 with
-# api_key_env OPENAI_API_KEY. Set model to one available from that provider.
+# grok_oauth uses xAI only for write_script and falls back to this configured
+# OpenAI-compatible provider on HTTP 403/429. Story drafting and narration
+# shortening always use the configured provider.
 script_provider:
+  provider: grok_oauth
   base_url: http://100.103.129.82:11434/v1
   model: qwen3.6:35b-a3b
   api_key_env: null
   # Overall ceiling; API_REQUEST_TIMEOUT remains the per-chunk inactivity limit.
   timeout_seconds: 900
+# Independent visual providers. CLI --visuals is shorthand; the individual
+# --frames-provider/--video-provider flags override it. Defaults stay local.
+frames_provider: local
+video_provider: local
+# Persisted per-run ceiling for billable Grok Imagine POST attempts, including
+# frame regeneration and bounded 429 retries.
+imagine_call_cap: 40
 # Narration drives timing: the script fills the target, then each clip uses its
 # measured shot narration plus padding, bounded by the per-clip cap.
 target_duration_seconds: 45
+narration_seconds_min: 4
+narration_seconds_max: 6
 clip_padding: 0.4
 max_clip_seconds: 6.0
 style_block: "isometric voxel diorama, chunky cubic blocks, cutaway cross-section view, tilt-shift macro photography, soft studio lighting, vibrant color palette against dark clean background, highly detailed 3D render"
+motion_block: "Exactly one short camera move per motion_instruction (for example \"slow push-in\", \"gentle pan left\", or \"static locked-off\"); do not combine moves."
 frame_model: flux2_klein
 video_mode: auto
 video_resolution: 720x1280

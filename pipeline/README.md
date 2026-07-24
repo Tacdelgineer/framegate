@@ -9,31 +9,42 @@ Copy `.env.example` to `/home/alireza/content-factory/pipeline/.env` and set
 `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`, then:
 
 ```bash
-cd /home/alireza/content-factory/pipeline
-./.venv/bin/python news_pipeline.py --new --topic "AI infrastructure news"
+cd /home/alireza/content-factory
+pipeline/.venv/bin/python -m pipeline.news_pipeline \
+  --new --topic "AI infrastructure news"
 ```
 
 The default script provider is the DGX Ollama OpenAI-compatible endpoint, and
 visuals default to the local DGX queue, so the default content path requires no
-model API key. To use `gpt-image-1` for frames and xAI Imagine for video, set
-`OPENAI_API_KEY` and `XAI_API_KEY` and run with `--visuals cloud`.
+model API key. `--visuals grok` uses Grok Imagine for both frames and
+image-to-video, reusing Hermes' existing xAI OAuth bearer when `XAI_API_KEY` is
+not set. `--visuals cloud` preserves the prior behavior: OpenAI frames plus
+the xAI API-key video lane.
+
+Cheap Grok credential/wire validation makes exactly one image generation and
+one image-to-video generation, writes both outputs to a temporary directory,
+prints paths and timings, and exits without SQLite, queue, or Telegram work:
+
+```bash
+pipeline/.venv/bin/python -m pipeline.news_pipeline --probe-visuals
+```
 
 Resume the newest non-terminal run:
 
 ```bash
-./.venv/bin/python news_pipeline.py
+pipeline/.venv/bin/python -m pipeline.news_pipeline
 ```
 
 Resume a specific run:
 
 ```bash
-./.venv/bin/python news_pipeline.py --run-id <uuid>
+pipeline/.venv/bin/python -m pipeline.news_pipeline --run-id <uuid>
 ```
 
 Cheap validation stops after frame generation, before Telegram frame approval:
 
 ```bash
-./.venv/bin/python news_pipeline.py --new --dry-run
+pipeline/.venv/bin/python -m pipeline.news_pipeline --new --dry-run
 ```
 
 The frame gate is enabled by default. `--no-frame-gate` skips it.
@@ -42,30 +53,63 @@ The frame gate is enabled by default. `--no-frame-gate` skips it.
 
 Every new run reads `../config/presets.yaml` and snapshots the resolved values
 in SQLite so a later edit cannot change a resumed run. The human-editable
-preset controls `target_duration_seconds`, `clip_padding`,
-`max_clip_seconds`, the verbatim frame-prompt `style_block`, local frame
-workflow, I2V/first-last-frame selection, resolution, draft/final steps,
-negative prompt, output FPS, and the independent OpenAI-compatible
-`script_provider`. The free-text `narration_style` is injected into the script
-prompt. `caption_style` controls caption enablement, size, base/highlight
-colors, and vertical position. `voice` selects `default` for the worker's stock
-voice or a named cloned-voice entry such as `narrator`.
+preset controls `target_duration_seconds`, `narration_seconds_min`,
+`narration_seconds_max`, `clip_padding`, `max_clip_seconds`, the verbatim
+frame-prompt `style_block`, per-shot `motion_block`, visual providers,
+the Grok call cap, local frame workflow, I2V/first-last-frame selection,
+resolution, draft/final steps, negative prompt, output FPS, and the independent
+OpenAI-compatible `script_provider`. The free-text `narration_style` is
+injected into the script prompt. `caption_style` controls caption enablement,
+size, base/highlight colors, and vertical position. `voice` selects `default`
+for the worker's stock voice or a named cloned-voice entry such as `narrator`.
 
-The script prompt requests enough 4–6-second narration shots to fill
-`target_duration_seconds` (nine shots at the 45-second default). TTS runs once
-per shot before frame/video generation. Each clip requests the measured
+`frames_provider` accepts `local`, `openai`, or `grok`; `video_provider`
+accepts `local`, `xai_key`, or `grok`. Both default to `local`. CLI shorthand
+expands as follows:
+
+| CLI | Frames | Video |
+| --- | --- | --- |
+| `--visuals local` | `local` | `local` |
+| `--visuals grok` | `grok` | `grok` |
+| `--visuals cloud` | `openai` | `xai_key` |
+
+`--frames-provider` and `--video-provider` override their respective side of
+the shorthand. Grok video accepts one approved first frame, so
+`video_provider: grok` with `video_mode: flf` is rejected at startup; `auto`
+uses I2V for Grok. `imagine_call_cap` defaults to 40 and counts billable Grok
+POST attempts across the complete run, including regeneration and 429 retry
+attempts.
+
+When a Grok provider is selected, bearer resolution is `XAI_API_KEY` first,
+then Hermes' stored `xai-oauth` access token. Framegate mirrors Hermes'
+`HERMES_HOME`/profile auth path resolution; `HERMES_AUTH_PATH` can override the
+file explicitly. OAuth is subscription-backed and read-only from Hermes:
+Framegate never refreshes, rotates, or persists the grant. Missing or expired
+credentials fail during startup pre-flight with instructions to re-auth in
+Hermes.
+
+The script prompt requests enough narration shots to fill
+`target_duration_seconds`, using the midpoint of `narration_seconds_min` and
+`narration_seconds_max` for shot sizing (nine shots with the 4–6-second range
+and 45-second defaults). The same range appears in the prompt and clamps the
+per-shot TTS target. TTS runs once per shot before frame/video generation. Each
+clip requests the measured
 narration duration plus `clip_padding`, rounded up to Wan's `4n+1` frame shape
 at 16fps without exceeding `max_clip_seconds`. Narration over the cap gets one
 script-provider shortening retry; if it is still long, assembly holds the last
 video frame instead of cutting the audio.
 
-`script_provider` contains `base_url`, `model`, optional `api_key_env`, and an
-overall streaming-generation `timeout_seconds` ceiling (default 900 seconds).
-Use `https://api.x.ai/v1` with `XAI_API_KEY` for xAI, or
-`https://api.openai.com/v1` with `OPENAI_API_KEY` for OpenAI. A selected key
-environment variable must be configured before a run starts. `--visuals` does
-not select or alter the script provider. Script calls stream their response;
-`API_REQUEST_TIMEOUT` is applied to each period of network inactivity, while
+`script_provider.provider` accepts `configured` or `grok_oauth`.
+`grok_oauth` sends only `write_script` to xAI's Chat Completions endpoint with
+the read-only bearer resolved by the shared xAI auth path (`XAI_API_KEY` first,
+then Hermes OAuth). HTTP 403/429 falls back with a warning to the configured
+`base_url` and `model`, which default to local Qwen. Story drafting and
+narration-shortening retries always use that configured provider. Quota/usage
+response headers and body token/cost usage are logged around the Grok call.
+The optional `api_key_env` authenticates a configured hosted fallback, and
+`timeout_seconds` is the overall streaming-generation ceiling (default 900
+seconds). `--visuals` does not select or alter the script provider.
+`API_REQUEST_TIMEOUT` applies to each period of network inactivity, while
 thinking/output chunks keep an otherwise slow generation alive.
 
 ## State machine
@@ -111,9 +155,11 @@ only that frame. Final-video Regenerate deletes generated media, rewinds to
   pipeline then burns the styled ASS track with ffmpeg's subtitles filter.
 
 Content-brief and script generation call the preset's OpenAI-compatible
-provider directly from the VPS. In local visual mode all five job types above
-use the queue; in cloud visual mode only TTS, transcription, and assembly use
-it.
+provider directly from the VPS. Provider selection is independent per visual
+stage. VPS-produced Grok/OpenAI frames keep the same run-relative names as
+local frames; Grok frames are normalized to 1080x1920 before the frame gate.
+VPS-produced clips keep `clips/shot_XX.mp4` and reuse the existing multipart
+assembly inputs to cross VPS→DGX. The DGX never receives the OAuth bearer.
 
 The queue client is imported from the sibling `../queue` directory by default.
 `JOB_QUEUE_CLIENT_ROOT` can override that location for development.
