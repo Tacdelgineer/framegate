@@ -40,12 +40,13 @@ unvalidated provider value or any other user text as shell syntax. Start full
 runs detached regardless of provider selection.
 
 ```bash
+cd /home/alireza/content-factory
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 RUN_LOG="/home/alireza/content-factory/pipeline/runs/pipeline-${STAMP}.log"
 RUN_PID="/home/alireza/content-factory/pipeline/runs/pipeline-${STAMP}.pid"
 VISUAL_ARGS=(--visuals local)
 nohup /home/alireza/content-factory/pipeline/.venv/bin/python \
-  /home/alireza/content-factory/pipeline/news_pipeline.py \
+  -m pipeline.news_pipeline \
   --new --topic "$TOPIC" "${VISUAL_ARGS[@]}" \
   >"$RUN_LOG" 2>&1 </dev/null &
 printf '%s\n' "$!" >"$RUN_PID"
@@ -96,16 +97,18 @@ Use only the pipeline status interface and request machine-readable output.
 unfinished run or, if none exists, the most-recent terminal run.
 
 ```bash
+cd /home/alireza/content-factory
 /home/alireza/content-factory/pipeline/.venv/bin/python \
-  /home/alireza/content-factory/pipeline/news_pipeline.py \
+  -m pipeline.news_pipeline \
   --run-id "$RUN_ID" --status --json
 ```
 
 For a human-readable summary of the current/most-recent run:
 
 ```bash
+cd /home/alireza/content-factory
 /home/alireza/content-factory/pipeline/.venv/bin/python \
-  /home/alireza/content-factory/pipeline/news_pipeline.py --status
+  -m pipeline.news_pipeline --status
 ```
 
 `--json` implies `--status`, but spell out both flags in operational commands.
@@ -173,17 +176,18 @@ only these actions:
 3. Restart the pipeline or queue service on this VPS.
 
 For a stuck detached run, verify that the PID file belongs to the exact
-`news_pipeline.py` run before sending `SIGTERM`. Never use `SIGKILL`. If it does
+`pipeline.news_pipeline` run before sending `SIGTERM`. Never use `SIGKILL`. If it does
 not stop cleanly, escalate. Resume with `--run-id`; never use `--new`. Preserve
 the run's original visual-provider selection in `VISUAL_ARGS`, using only the
 literal whitelisted values above.
 
 ```bash
+cd /home/alireza/content-factory
 PID="$(<"$RUN_PID")"
 ps -p "$PID" -o pid=,args=
 kill -TERM "$PID"
 nohup /home/alireza/content-factory/pipeline/.venv/bin/python \
-  /home/alireza/content-factory/pipeline/news_pipeline.py \
+  -m pipeline.news_pipeline \
   --run-id "$RUN_ID" "${VISUAL_ARGS[@]}" \
   >"$RUN_LOG" 2>&1 </dev/null &
 printf '%s\n' "$!" >"$RUN_PID"

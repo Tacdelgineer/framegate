@@ -47,7 +47,7 @@ if str(JOB_QUEUE_CLIENT_ROOT) not in sys.path:
     sys.path.insert(0, str(JOB_QUEUE_CLIENT_ROOT))
 
 from job_queue import JobFailedError, JobQueueClient, JobQueueError  # noqa: E402
-from providers.grok_imagine import (  # noqa: E402
+from pipeline.providers.grok_imagine import (  # noqa: E402
     GrokImagineClient,
     ImagineCallCapError,
     XAIEntitlementError,
@@ -56,7 +56,7 @@ from providers.grok_imagine import (  # noqa: E402
     conform_video_duration,
     normalize_frame_bytes,
 )
-from providers.xai_auth import (  # noqa: E402
+from pipeline.providers.xai_auth import (  # noqa: E402
     XAICredentials,
     XAIAuthError,
     resolve_xai_credentials,

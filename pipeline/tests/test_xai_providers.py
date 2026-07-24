@@ -10,13 +10,13 @@ import httpx
 import pytest
 from PIL import Image
 
-from providers.grok_imagine import (
+from pipeline.providers.grok_imagine import (
     GrokImagineClient,
     XAIEntitlementError,
     XAIRateLimitError,
     normalize_frame_bytes,
 )
-from providers.xai_auth import (
+from pipeline.providers.xai_auth import (
     XAICredentials,
     XAIAuthError,
     hermes_auth_paths,

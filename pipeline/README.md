@@ -9,8 +9,9 @@ Copy `.env.example` to `/home/alireza/content-factory/pipeline/.env` and set
 `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`, then:
 
 ```bash
-cd /home/alireza/content-factory/pipeline
-./.venv/bin/python news_pipeline.py --new --topic "AI infrastructure news"
+cd /home/alireza/content-factory
+pipeline/.venv/bin/python -m pipeline.news_pipeline \
+  --new --topic "AI infrastructure news"
 ```
 
 The default script provider is the DGX Ollama OpenAI-compatible endpoint, and
@@ -25,25 +26,25 @@ one image-to-video generation, writes both outputs to a temporary directory,
 prints paths and timings, and exits without SQLite, queue, or Telegram work:
 
 ```bash
-./.venv/bin/python news_pipeline.py --probe-visuals
+pipeline/.venv/bin/python -m pipeline.news_pipeline --probe-visuals
 ```
 
 Resume the newest non-terminal run:
 
 ```bash
-./.venv/bin/python news_pipeline.py
+pipeline/.venv/bin/python -m pipeline.news_pipeline
 ```
 
 Resume a specific run:
 
 ```bash
-./.venv/bin/python news_pipeline.py --run-id <uuid>
+pipeline/.venv/bin/python -m pipeline.news_pipeline --run-id <uuid>
 ```
 
 Cheap validation stops after frame generation, before Telegram frame approval:
 
 ```bash
-./.venv/bin/python news_pipeline.py --new --dry-run
+pipeline/.venv/bin/python -m pipeline.news_pipeline --new --dry-run
 ```
 
 The frame gate is enabled by default. `--no-frame-gate` skips it.

@@ -15,10 +15,9 @@ import httpx
 import pytest
 from PIL import Image
 
-from providers.grok_imagine import VideoCompletion
-from providers.xai_auth import XAICredentials
-
-import news_pipeline as module
+from pipeline import news_pipeline as module
+from pipeline.providers.grok_imagine import VideoCompletion
+from pipeline.providers.xai_auth import XAICredentials
 
 
 def load_worker_contract_module():
