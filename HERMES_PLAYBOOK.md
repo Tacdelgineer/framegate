@@ -19,21 +19,75 @@ text as shell syntax.
 ### Start a detached run
 
 Require a topic from the user. Preserve it exactly as one safely quoted argument.
-Use local visuals unless the user explicitly requests cloud. Always spell out
-`--visuals local`; it is the current default. Do not add `--no-frame-gate`
-unless the user explicitly requests it.
+Use local visuals unless the user explicitly requests Grok, cloud, or an
+individual provider override. Always spell out `--visuals local` for the
+default. Do not add `--no-frame-gate` unless the user explicitly requests it.
+
+The only allowed visual-provider arguments for a full run are:
+
+```text
+--visuals local|grok|cloud
+--frames-provider local|openai|grok
+--video-provider local|xai_key|grok
+```
+
+`--visuals` is shorthand: `local` selects local frames and video, `grok`
+selects Grok Imagine frames and video, and `cloud` selects OpenAI frames plus
+xAI API-key video. An individual `--frames-provider` or `--video-provider`
+value wins over `--visuals`. Validate every value against the literal choices
+above and place the selected flags in `VISUAL_ARGS`; never interpolate an
+unvalidated provider value or any other user text as shell syntax. Start full
+runs detached regardless of provider selection.
 
 ```bash
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 RUN_LOG="/home/alireza/content-factory/pipeline/runs/pipeline-${STAMP}.log"
 RUN_PID="/home/alireza/content-factory/pipeline/runs/pipeline-${STAMP}.pid"
+VISUAL_ARGS=(--visuals local)
 nohup /home/alireza/content-factory/pipeline/.venv/bin/python \
   /home/alireza/content-factory/pipeline/news_pipeline.py \
-  --new --topic "$TOPIC" --visuals local \
+  --new --topic "$TOPIC" "${VISUAL_ARGS[@]}" \
   >"$RUN_LOG" 2>&1 </dev/null &
 printf '%s\n' "$!" >"$RUN_PID"
 printf 'pid=%s log=%s\n' "$!" "$RUN_LOG"
 ```
+
+### Probe Grok visuals
+
+When the user asks to test Grok, run this probe immediately without a second
+confirmation. It is a cheap foreground auth and generation check, normally
+taking about one minute. It makes exactly one image call and one
+image-to-video call and does not create a run, enter the queue, or use the
+Telegram frame gate. Run it from the repository root with the pipeline's
+virtualenv interpreter; this host has no global `python` executable.
+
+```bash
+cd /home/alireza/content-factory
+/home/alireza/content-factory/pipeline/.venv/bin/python -m pipeline.news_pipeline \
+  --probe-visuals --frames-provider grok --video-provider grok
+```
+
+Use only the `image_path` and `video_path` returned by the probe JSON. These
+read-only commands are whitelisted for collecting the required artifact
+metadata:
+
+```bash
+/usr/bin/file -- "$IMAGE_PATH"
+/usr/bin/ffprobe -v error -select_streams v:0 \
+  -show_entries stream=width,height:format=duration -of json "$VIDEO_PATH"
+```
+
+On successful completion, report in Telegram the shell exit status, both
+absolute artifact paths, image width and height, video duration and resolution,
+and `timings_seconds.total` as total elapsed time. Then attach both files to the
+same Telegram conversation by placing one real, unquoted `MEDIA:` directive per
+line in the response: `MEDIA:<absolute-image-path>` and
+`MEDIA:<absolute-video-path>`. Do not put the directives in a code block. The
+gateway must deliver the PNG and MP4 as native attachments so the user can
+judge both from a phone. If attachment delivery fails, say so explicitly; do
+not claim that paths alone are delivery. If the probe fails before producing
+both files, report its nonzero status and the interpreted error instead of
+inventing paths or attachments.
 
 ### Check run status
 
@@ -80,6 +134,34 @@ curl --fail --silent --show-error --max-time 5 \
 
 The first URL is the queue on this VPS. The second is the worker on the DGX.
 
+## Error interpretation
+
+Explain operational failures in plain language; do not dump a traceback into
+Telegram. Include the final causal error and the operation or stage in progress,
+then apply these Grok-specific rules:
+
+- An HTTP 403 from an Imagine call means the SuperGrok subscription tier does
+  not entitle this API surface, even if image or video generation works inside
+  Hermes chat. Tell the user that plainly. Do not retry. Recommend setting
+  `XAI_API_KEY` through the normal administrator-managed secret process or
+  falling back to `--visuals local`. Never inspect or edit `.env` yourself.
+- An HTTP 429 is a rate limit. The pipeline retries it automatically three
+  times with backoff. Do not add parallel or manual retries; if all three fail,
+  report that the automatic attempts were exhausted and identify the stage.
+- If the Imagine call cap is reached, report the configured cap and the stage
+  and shot, when available, that attempted the next call. Do not raise the cap
+  by editing configuration unless the user separately requests a permitted
+  preset change.
+- Any failure at `assemble` after a Grok run is a possible VPS-to-DGX artifact
+  transfer problem. Check the whitelisted status, relevant log tail, and health
+  endpoints, then summarize the evidence using the escalation format below.
+  Do not re-enqueue it, modify files, or attempt a fix; refer it to a coding
+  agent.
+
+All code defects and unsupported operational changes are escalations.
+factory-ops never edits pipeline code or `.env` and leaves diagnosis and fixes
+to the user, Codex, or Claude Code.
+
 ## Recovery tier
 
 Perform a recovery action only after showing the user the status, relevant log
@@ -93,7 +175,8 @@ only these actions:
 For a stuck detached run, verify that the PID file belongs to the exact
 `news_pipeline.py` run before sending `SIGTERM`. Never use `SIGKILL`. If it does
 not stop cleanly, escalate. Resume with `--run-id`; never use `--new`. Preserve
-the run's original visuals mode.
+the run's original visual-provider selection in `VISUAL_ARGS`, using only the
+literal whitelisted values above.
 
 ```bash
 PID="$(<"$RUN_PID")"
@@ -101,7 +184,7 @@ ps -p "$PID" -o pid=,args=
 kill -TERM "$PID"
 nohup /home/alireza/content-factory/pipeline/.venv/bin/python \
   /home/alireza/content-factory/pipeline/news_pipeline.py \
-  --run-id "$RUN_ID" --visuals "$VISUALS" \
+  --run-id "$RUN_ID" "${VISUAL_ARGS[@]}" \
   >"$RUN_LOG" 2>&1 </dev/null &
 printf '%s\n' "$!" >"$RUN_PID"
 ```
