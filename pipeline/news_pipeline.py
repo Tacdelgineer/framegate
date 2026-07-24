@@ -17,9 +17,11 @@ import mimetypes
 import os
 import re
 import secrets
+import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 import wave
@@ -45,6 +47,20 @@ if str(JOB_QUEUE_CLIENT_ROOT) not in sys.path:
     sys.path.insert(0, str(JOB_QUEUE_CLIENT_ROOT))
 
 from job_queue import JobFailedError, JobQueueClient, JobQueueError  # noqa: E402
+from providers.grok_imagine import (  # noqa: E402
+    GrokImagineClient,
+    ImagineCallCapError,
+    XAIEntitlementError,
+    XAIRateLimitError,
+    XAIVideoTerminalError,
+    conform_video_duration,
+    normalize_frame_bytes,
+)
+from providers.xai_auth import (  # noqa: E402
+    XAICredentials,
+    XAIAuthError,
+    resolve_xai_credentials,
+)
 
 
 LOG = logging.getLogger("news_pipeline")
@@ -75,7 +91,14 @@ XAI_VIDEO_STATUS_URL = "https://api.x.ai/v1/videos/{request_id}"
 OPENAI_IMAGE_URL = "https://api.openai.com/v1/images/generations"
 OPENAI_FRAME_MODEL = "gpt-image-1"
 DEFAULT_PRESET_PATH = MONOREPO_ROOT / "config" / "presets.yaml"
-VISUAL_BACKENDS = {"local", "cloud"}
+FRAME_PROVIDERS = {"local", "openai", "grok"}
+VIDEO_PROVIDERS = {"local", "xai_key", "grok"}
+VISUAL_SHORTHANDS = {
+    "local": ("local", "local"),
+    "cloud": ("openai", "xai_key"),
+    "grok": ("grok", "grok"),
+}
+VISUAL_BACKENDS = set(VISUAL_SHORTHANDS)
 VIDEO_MODES = {"i2v", "flf", "auto"}
 DEFAULT_STYLE_BLOCK = "Cinematic news documentary photography, realistic lighting. "
 DEFAULT_NARRATION_STYLE = "Conversational, curious, direct, and warm."
@@ -526,6 +549,9 @@ class CaptionStyleConfig:
 @dataclass(frozen=True)
 class PipelineConfig:
     script_provider: ScriptProviderConfig = field(default_factory=ScriptProviderConfig)
+    frames_provider: str = "local"
+    video_provider: str = "local"
+    imagine_call_cap: int = 40
     target_duration_seconds: float = 45.0
     clip_padding: float = 0.4
     max_clip_seconds: float = 8.0
@@ -558,6 +584,9 @@ class PipelineConfig:
             raise ValueError("caption_style must be a YAML mapping")
         config = cls(
             script_provider=ScriptProviderConfig.from_mapping(raw_script_provider),
+            frames_provider=merged["frames_provider"],
+            video_provider=merged["video_provider"],
+            imagine_call_cap=merged["imagine_call_cap"],
             target_duration_seconds=merged["target_duration_seconds"],
             clip_padding=merged["clip_padding"],
             max_clip_seconds=merged["max_clip_seconds"],
@@ -591,6 +620,22 @@ class PipelineConfig:
     def validate(self) -> None:
         self.script_provider.validate()
         self.caption_style.validate()
+        if self.frames_provider not in FRAME_PROVIDERS:
+            raise ValueError(
+                "frames_provider must be one of: "
+                + ", ".join(sorted(FRAME_PROVIDERS))
+            )
+        if self.video_provider not in VIDEO_PROVIDERS:
+            raise ValueError(
+                "video_provider must be one of: "
+                + ", ".join(sorted(VIDEO_PROVIDERS))
+            )
+        if (
+            isinstance(self.imagine_call_cap, bool)
+            or not isinstance(self.imagine_call_cap, int)
+            or self.imagine_call_cap <= 0
+        ):
+            raise ValueError("imagine_call_cap must be a positive integer")
         for name in ("style_block", "frame_model", "video_resolution"):
             if not isinstance(getattr(self, name), str) or not getattr(self, name):
                 raise ValueError(f"{name} must be a non-empty string")
@@ -632,6 +677,9 @@ class PipelineConfig:
     def to_dict(self) -> dict[str, Any]:
         return {
             "script_provider": self.script_provider.to_dict(),
+            "frames_provider": self.frames_provider,
+            "video_provider": self.video_provider,
+            "imagine_call_cap": self.imagine_call_cap,
             "target_duration_seconds": self.target_duration_seconds,
             "clip_padding": self.clip_padding,
             "max_clip_seconds": self.max_clip_seconds,
@@ -647,6 +695,58 @@ class PipelineConfig:
             "narration_style": self.narration_style,
             "voice": self.voice,
         }
+
+
+@dataclass(frozen=True)
+class VisualProviders:
+    frames: str = "local"
+    video: str = "local"
+
+    def validate(self, config: PipelineConfig) -> None:
+        if self.frames not in FRAME_PROVIDERS:
+            raise ValueError(
+                "frames provider must be one of: "
+                + ", ".join(sorted(FRAME_PROVIDERS))
+            )
+        if self.video not in VIDEO_PROVIDERS:
+            raise ValueError(
+                "video provider must be one of: "
+                + ", ".join(sorted(VIDEO_PROVIDERS))
+            )
+        if self.video == "grok" and config.video_mode == "flf":
+            raise ValueError(
+                "Invalid visual provider combination: video_provider=grok is "
+                "image-to-video and accepts one approved first frame, but "
+                "video_mode=flf requires first and last frames. Use video_mode=i2v "
+                "or auto, choose video_provider=local, or switch back to "
+                "--visuals local."
+            )
+
+
+def resolve_visual_providers(
+    config: PipelineConfig,
+    *,
+    visuals: str | None = None,
+    frames_provider: str | None = None,
+    video_provider: str | None = None,
+) -> VisualProviders:
+    """Resolve preset defaults, then shorthand, then individual CLI overrides."""
+    frames = config.frames_provider
+    video = config.video_provider
+    if visuals is not None:
+        try:
+            frames, video = VISUAL_SHORTHANDS[visuals]
+        except KeyError as exc:
+            raise ValueError(
+                "visuals must be one of: " + ", ".join(sorted(VISUAL_BACKENDS))
+            ) from exc
+    if frames_provider is not None:
+        frames = frames_provider
+    if video_provider is not None:
+        video = video_provider
+    selected = VisualProviders(frames=frames, video=video)
+    selected.validate(config)
+    return selected
 
 
 def extract_timestamped_words(
@@ -906,6 +1006,8 @@ class Settings:
     telegram_chat_id: str
     telegram_poll_timeout: int
     approval_wait_timeout: float
+    ffmpeg_bin: str = "ffmpeg"
+    ffprobe_bin: str = "ffprobe"
 
     @classmethod
     def from_environment(
@@ -946,6 +1048,8 @@ class Settings:
             ),
             telegram_poll_timeout=int(os.getenv("TELEGRAM_POLL_TIMEOUT", "25")),
             approval_wait_timeout=float(os.getenv("APPROVAL_WAIT_TIMEOUT", "0")),
+            ffmpeg_bin=os.getenv("FFMPEG_BIN", "ffmpeg"),
+            ffprobe_bin=os.getenv("FFPROBE_BIN", "ffprobe"),
         )
 
 
@@ -986,6 +1090,7 @@ RUN_COLUMNS = {
     "last_error",
     "publish_json",
     "published_at",
+    "imagine_calls",
 }
 
 
@@ -1051,7 +1156,8 @@ class StateStore:
                     telegram_message_id TEXT,
                     last_error TEXT,
                     publish_json TEXT,
-                    published_at TEXT
+                    published_at TEXT,
+                    imagine_calls INTEGER NOT NULL DEFAULT 0
                 );
 
                 CREATE INDEX IF NOT EXISTS runs_updated_at
@@ -1118,6 +1224,10 @@ class StateStore:
                 connection.execute("ALTER TABLE runs ADD COLUMN run_config_json TEXT")
             if "shot_audio_json" not in columns:
                 connection.execute("ALTER TABLE runs ADD COLUMN shot_audio_json TEXT")
+            if "imagine_calls" not in columns:
+                connection.execute(
+                    "ALTER TABLE runs ADD COLUMN imagine_calls INTEGER NOT NULL DEFAULT 0"
+                )
 
     def create_run(self, topic: str) -> dict[str, Any]:
         run_id = str(uuid.uuid4())
@@ -1143,6 +1253,29 @@ class StateStore:
         if row is None:
             raise ValueError(f"Unknown pipeline run: {run_id}")
         return dict(row)
+
+    def consume_imagine_call(self, run_id: str, cap: int) -> int:
+        """Atomically reserve one billable Imagine request for this run."""
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT imagine_calls FROM runs WHERE id = ?", (run_id,)
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"Unknown pipeline run: {run_id}")
+            used = int(row["imagine_calls"] or 0)
+            if used >= cap:
+                raise ImagineCallCapError(
+                    f"Run {run_id} reached its Grok Imagine call cap of {cap}. "
+                    "Increase imagine_call_cap deliberately or switch back to "
+                    "`--visuals local`."
+                )
+            used += 1
+            connection.execute(
+                "UPDATE runs SET imagine_calls = ?, updated_at = ? WHERE id = ?",
+                (used, utc_now(), run_id),
+            )
+        return used
 
     def latest_resumable(self) -> dict[str, Any] | None:
         with self.connect() as connection:
@@ -1374,19 +1507,33 @@ class NewsPipeline:
         run: Mapping[str, Any],
         *,
         config: PipelineConfig | None = None,
-        visuals: str = "local",
+        visuals: str | None = None,
+        frames_provider: str | None = None,
+        video_provider: str | None = None,
+        grok_credentials: XAICredentials | None = None,
         frame_gate: bool = True,
         http_client: httpx.Client | None = None,
         queue_client: JobQueueClient | None = None,
     ):
-        if visuals not in VISUAL_BACKENDS:
-            raise ValueError(
-                "visuals must be one of: " + ", ".join(sorted(VISUAL_BACKENDS))
-            )
         self.settings = settings
         self.config = config or PipelineConfig()
         self.config.validate()
-        self.visuals = visuals
+        self.providers = resolve_visual_providers(
+            self.config,
+            visuals=visuals,
+            frames_provider=frames_provider,
+            video_provider=video_provider,
+        )
+        self.frames_provider = self.providers.frames
+        self.video_provider = self.providers.video
+        self.visuals = next(
+            (
+                shorthand
+                for shorthand, pair in VISUAL_SHORTHANDS.items()
+                if pair == (self.frames_provider, self.video_provider)
+            ),
+            "mixed",
+        )
         self.frame_gate = frame_gate
         self.store = store
         self.run_id = str(run["id"])
@@ -1404,6 +1551,22 @@ class NewsPipeline:
             request_timeout=settings.request_timeout,
         )
         self._owns_queue = queue_client is None
+        self.grok: GrokImagineClient | None = None
+        if "grok" in {self.frames_provider, self.video_provider}:
+            credentials = grok_credentials or resolve_xai_credentials(
+                api_key_env_value=settings.xai_api_key
+            )
+            self.grok = GrokImagineClient(
+                credentials,
+                self.http,
+                request_timeout=settings.request_timeout,
+                poll_interval=settings.video_poll_interval,
+                poll_timeout=settings.video_poll_timeout,
+                retry_base_seconds=settings.retry_base_seconds,
+                consume_call=lambda: self.store.consume_imagine_call(
+                    self.run_id, self.config.imagine_call_cap
+                ),
+            )
 
     def close(self) -> None:
         if self._owns_queue:
@@ -1427,6 +1590,16 @@ class NewsPipeline:
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
             detail = response.text[:1500].strip()
+            if provider.lower().startswith("xai") and response.status_code == 403:
+                raise XAIEntitlementError(
+                    "xAI Imagine returned HTTP 403 (tier/entitlement problem). "
+                    "Set XAI_API_KEY or switch back to `--visuals local`."
+                ) from exc
+            if provider.lower().startswith("xai") and response.status_code == 429:
+                raise RemoteAPIError(
+                    "xAI Imagine returned HTTP 429 (rate limit); the pipeline "
+                    "will retry with its bounded 3-attempt backoff policy."
+                ) from exc
             raise RemoteAPIError(
                 f"{provider} returned HTTP {response.status_code}: {detail}"
             ) from exc
@@ -1635,6 +1808,9 @@ visually without on-screen text.
         story = json_load(self.current()["story_json"], None)
         if not isinstance(story, dict):
             raise ValueError("Cannot write a script without story JSON")
+        configured_video_mode = (
+            "i2v" if self.video_provider == "grok" else self.config.video_mode
+        )
         mode_instruction = {
             "i2v": (
                 'Set "video_mode" to "i2v" and "last_frame_prompt" to null '
@@ -1649,7 +1825,7 @@ visually without on-screen text.
                 "specific ending composition materially improves the shot; "
                 "otherwise use i2v. Provide last_frame_prompt only for flf."
             ),
-        }[self.config.video_mode]
+        }[configured_video_mode]
         target_seconds = self.config.target_duration_seconds
         shot_count = target_shot_count(target_seconds)
         average_seconds = target_seconds / shot_count
@@ -1746,8 +1922,8 @@ Requirements:
                     f"Shot {index} motion_instruction must be one camera move"
                 )
             mode = (
-                self.config.video_mode
-                if self.config.video_mode != "auto"
+                configured_video_mode
+                if configured_video_mode != "auto"
                 else str(shot.get("video_mode", "")).lower()
             )
             if mode not in {"i2v", "flf"}:
@@ -1782,9 +1958,12 @@ Requirements:
         return f"{self.config.style_block}{prompt}"
 
     def _shot_mode(self, shot: Mapping[str, Any], index: int) -> str:
+        configured_video_mode = (
+            "i2v" if self.video_provider == "grok" else self.config.video_mode
+        )
         mode = (
-            self.config.video_mode
-            if self.config.video_mode != "auto"
+            configured_video_mode
+            if configured_video_mode != "auto"
             else str(shot.get("video_mode", "")).lower()
         )
         if mode not in {"i2v", "flf"}:
@@ -1921,7 +2100,7 @@ Requirements:
         )
         if self.config.negative_prompt:
             prompt += f"\nAvoid: {self.config.negative_prompt}."
-        if self.visuals == "cloud":
+        if self.frames_provider != "local":
             prompt += f"\nVariation seed: {seed}."
         return prompt
 
@@ -1933,7 +2112,7 @@ Requirements:
         path = Path(spec["path"])
         seed = int(gate_frame["seed"])
         generation = int(gate_frame["generation"])
-        if self.visuals == "local":
+        if self.frames_provider == "local":
             self._queue_job(
                 (f"frame:{spec['shot_index']}:{spec['role']}:generation:{generation}"),
                 "frame",
@@ -1950,10 +2129,17 @@ Requirements:
                 {},
                 path,
             )
-        elif not valid_file(path):
+        elif self.frames_provider == "openai" and not valid_file(path):
             atomic_write_bytes(
                 path,
                 self._openai_image(self._frame_prompt(spec, seed)),
+            )
+        elif self.frames_provider == "grok" and not valid_file(path):
+            if self.grok is None:
+                raise RuntimeError("Grok frame provider was not initialized")
+            normalize_frame_bytes(
+                self.grok.generate_image(self._frame_prompt(spec, seed)),
+                path,
             )
 
     def generate_first_frames(self) -> None:
@@ -1992,7 +2178,7 @@ Requirements:
             self.run_id, video_requests_json=json.dumps(dict(requests))
         )
 
-    def _start_video(
+    def _start_xai_key_video(
         self,
         first_frame: Path,
         prompt: str,
@@ -2021,7 +2207,7 @@ Requirements:
             raise RemoteAPIError("xAI Imagine did not return request_id")
         return str(request_id)
 
-    def _poll_video(self, request_id: str) -> str:
+    def _poll_xai_key_video(self, request_id: str) -> str:
         api_key = self.require_key("XAI_API_KEY", self.settings.xai_api_key)
         deadline = time.monotonic() + self.settings.video_poll_timeout
         while True:
@@ -2033,12 +2219,19 @@ Requirements:
             state = str(data.get("status", "")).lower()
             if state == "done":
                 try:
-                    return str(data["video"]["url"])
-                except (KeyError, TypeError) as exc:
+                    video = data["video"]
+                    file_output = video.get("file_output")
+                    public_url = (
+                        file_output.get("public_url")
+                        if isinstance(file_output, Mapping)
+                        else None
+                    )
+                    return str(public_url or video["url"])
+                except (KeyError, TypeError, AttributeError) as exc:
                     raise RemoteAPIError(
                         "Completed xAI video response did not contain a URL"
                     ) from exc
-            if state in {"failed", "expired"}:
+            if state in {"failed", "error", "expired", "cancelled"}:
                 raise RemoteAPIError(
                     f"xAI video request {request_id} ended as {state}: "
                     f"{json.dumps(data)[:1000]}"
@@ -2058,6 +2251,18 @@ Requirements:
                 try:
                     response.raise_for_status()
                 except httpx.HTTPStatusError as exc:
+                    if response.status_code == 403:
+                        raise XAIEntitlementError(
+                            "xAI Imagine media download returned HTTP 403 "
+                            "(tier/entitlement problem). Set XAI_API_KEY or "
+                            "switch back to `--visuals local`."
+                        ) from exc
+                    if response.status_code == 429:
+                        raise RemoteAPIError(
+                            "xAI Imagine media download returned HTTP 429 "
+                            "(rate limit); the pipeline will retry with its "
+                            "bounded 3-attempt backoff policy."
+                        ) from exc
                     raise RemoteAPIError(
                         f"Download failed with HTTP {response.status_code}"
                     ) from exc
@@ -2140,7 +2345,7 @@ Requirements:
                 motion = str(
                     shot.get("motion_instruction") or shot.get("visual_prompt") or ""
                 ).strip()
-                if self.visuals == "local":
+                if self.video_provider == "local":
                     payload, input_files = build_local_video_job(
                         mode=mode,
                         first_frame=first_frame,
@@ -2160,11 +2365,11 @@ Requirements:
                         input_files,
                         path,
                     )
-                else:
+                elif self.video_provider == "xai_key":
                     request_id = requests.get(key)
                     if not request_id:
                         LOG.info("Submitting xAI video %s/%s", index, len(shots))
-                        request_id = self._start_video(
+                        request_id = self._start_xai_key_video(
                             first_frame,
                             motion,
                             float(timing["clip_seconds"]),
@@ -2173,7 +2378,7 @@ Requirements:
                         requests[key] = request_id
                         self._persist_video_requests(requests)
                     try:
-                        video_url = self._poll_video(request_id)
+                        video_url = self._poll_xai_key_video(request_id)
                     except RemoteAPIError as exc:
                         if "ended as failed" in str(exc) or "ended as expired" in str(
                             exc
@@ -2183,6 +2388,64 @@ Requirements:
                         raise
                     LOG.info("Downloading xAI video %s/%s", index, len(shots))
                     self._download_file(video_url, path)
+                else:
+                    if self.grok is None:
+                        raise RuntimeError("Grok video provider was not initialized")
+                    if last_frame is not None:
+                        raise ValueError(
+                            f"Shot {index} resolved two approved frames, but Grok "
+                            "image-to-video accepts exactly one first frame"
+                        )
+                    request_id = requests.get(key)
+                    if not request_id:
+                        LOG.info(
+                            "Submitting Grok image-to-video %s/%s",
+                            index,
+                            len(shots),
+                        )
+                        request_id = self.grok.start_image_to_video(
+                            first_frame,
+                            motion,
+                            float(timing["clip_seconds"]),
+                        )
+                        requests[key] = request_id
+                        self._persist_video_requests(requests)
+                    try:
+                        completion = self.grok.poll_video(request_id)
+                    except XAIVideoTerminalError:
+                        requests.pop(key, None)
+                        self._persist_video_requests(requests)
+                        raise
+                    raw_path = path.with_name(
+                        f".{path.stem}.{uuid.uuid4().hex}.grok-raw.mp4"
+                    )
+                    try:
+                        LOG.info(
+                            "Downloading Grok image-to-video %s/%s",
+                            index,
+                            len(shots),
+                        )
+                        self.grok.download_video(completion, raw_path)
+                        requested_seconds = float(timing["clip_seconds"])
+                        source_seconds, output_seconds = conform_video_duration(
+                            raw_path,
+                            path,
+                            requested_seconds,
+                            ffmpeg_bin=self.settings.ffmpeg_bin,
+                            ffprobe_bin=self.settings.ffprobe_bin,
+                        )
+                        if abs(source_seconds - requested_seconds) > 0.01:
+                            LOG.warning(
+                                "Shot %s Grok video duration mismatch: API clip "
+                                "%.3fs, narration-derived request %.3fs; conformed "
+                                "video to %.3fs without modifying narration audio",
+                                index,
+                                source_seconds,
+                                requested_seconds,
+                                output_seconds,
+                            )
+                    finally:
+                        raw_path.unlink(missing_ok=True)
             clips.append(str(path))
             self.store.update_run(
                 self.run_id,
@@ -3258,7 +3521,15 @@ Return exactly:
                 error = f"{type(exc).__name__}: {exc}"
                 self.store.finish_attempt(attempt_id, "failed", error)
                 self.store.update_run(self.run_id, last_error=error)
-                if isinstance(exc, NonRetryableWorkerError):
+                if isinstance(
+                    exc,
+                    (
+                        NonRetryableWorkerError,
+                        ImagineCallCapError,
+                        XAIEntitlementError,
+                        XAIRateLimitError,
+                    ),
+                ):
                     LOG.error("Stage %s failed permanently: %s", stage, error)
                     raise
                 if retry == 3:
@@ -3393,8 +3664,29 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--visuals",
         choices=sorted(VISUAL_BACKENDS),
-        default="local",
-        help="Visual generation backend (default: local).",
+        default=None,
+        help=(
+            "Shorthand provider pair: local=local/local, grok=grok/grok, "
+            "cloud=openai/xai_key. Preset defaults apply when omitted."
+        ),
+    )
+    parser.add_argument(
+        "--frames-provider",
+        choices=sorted(FRAME_PROVIDERS),
+        help="Override only the frame provider; wins over --visuals.",
+    )
+    parser.add_argument(
+        "--video-provider",
+        choices=sorted(VIDEO_PROVIDERS),
+        help="Override only the video provider; wins over --visuals.",
+    )
+    parser.add_argument(
+        "--probe-visuals",
+        action="store_true",
+        help=(
+            "Make one Grok image call and one Grok image-to-video call in a "
+            "temporary directory, print paths/timings, and exit."
+        ),
     )
     parser.add_argument(
         "--no-frame-gate",
@@ -3460,47 +3752,182 @@ def configure_run(
     run: Mapping[str, Any],
     *,
     config: PipelineConfig,
-    visuals: str,
+    visuals: str | None = None,
+    frames_provider: str | None = None,
+    video_provider: str | None = None,
     frame_gate: bool,
     preset_path: Path | None = None,
-) -> tuple[dict[str, Any], PipelineConfig, str, bool]:
+) -> tuple[dict[str, Any], PipelineConfig, VisualProviders, bool]:
     stored = json_load(run.get("run_config_json"), {})
     if isinstance(stored, Mapping) and stored.get("preset"):
         run_config = PipelineConfig.from_mapping(stored["preset"])
-        run_visuals = str(stored.get("visuals", "local"))
-        if run_visuals not in VISUAL_BACKENDS:
-            raise ValueError(
-                f"Run {run['id']} has invalid visuals backend: {run_visuals}"
+        stored_frames = stored.get("frames_provider")
+        stored_video = stored.get("video_provider")
+        legacy_visuals = stored.get("visuals")
+        if stored_frames is None and stored_video is None and legacy_visuals in VISUAL_BACKENDS:
+            selected = resolve_visual_providers(
+                run_config,
+                visuals=str(legacy_visuals),
             )
-        return dict(run), run_config, run_visuals, bool(stored.get("frame_gate", True))
+        else:
+            selected = resolve_visual_providers(
+                run_config,
+                frames_provider=(
+                    str(stored_frames) if stored_frames is not None else None
+                ),
+                video_provider=(
+                    str(stored_video) if stored_video is not None else None
+                ),
+            )
+        return dict(run), run_config, selected, bool(stored.get("frame_gate", True))
+    selected = resolve_visual_providers(
+        config,
+        visuals=visuals,
+        frames_provider=frames_provider,
+        video_provider=video_provider,
+    )
     snapshot = {
         "preset": config.to_dict(),
-        "visuals": visuals,
+        "frames_provider": selected.frames,
+        "video_provider": selected.video,
         "frame_gate": frame_gate,
         "preset_path": str(preset_path) if preset_path else None,
         "loaded_at": utc_now(),
     }
     updated = store.update_run(str(run["id"]), run_config_json=json.dumps(snapshot))
-    return updated, config, visuals, frame_gate
+    return updated, config, selected, frame_gate
 
 
 def validate_startup(
     settings: Settings,
-    visuals: str,
+    providers: VisualProviders | str,
     config: PipelineConfig,
-) -> None:
+) -> XAICredentials | None:
     voice_reference_payload(config.voice)
+    if isinstance(providers, str):
+        providers = resolve_visual_providers(config, visuals=providers)
+    providers.validate(config)
     provider = config.script_provider
     if provider.api_key_env and not script_provider_api_key(settings, provider):
         raise RuntimeError(
             f"{provider.api_key_env} is required by the selected script_provider; "
             "refusing to start before any API spend or queue activity."
         )
-    if visuals == "cloud" and not settings.xai_api_key:
+    if providers.frames == "openai" and not settings.openai_api_key:
         raise RuntimeError(
-            "XAI_API_KEY is required for --visuals cloud; refusing to start "
-            "before any API spend or queue activity."
+            "OPENAI_API_KEY is required for frames_provider=openai; refusing "
+            "to start before any API spend or queue activity."
         )
+    if providers.video == "xai_key" and not settings.xai_api_key:
+        raise RuntimeError(
+            "XAI_API_KEY is required for video_provider=xai_key; refusing to "
+            "start before any API spend or queue activity."
+        )
+    if "grok" not in {providers.frames, providers.video}:
+        return None
+    try:
+        credentials = resolve_xai_credentials(
+            api_key_env_value=settings.xai_api_key
+        )
+    except XAIAuthError as exc:
+        raise RuntimeError(
+            f"Grok Imagine credential pre-flight failed: {exc} Refusing to "
+            "start before any API spend or queue activity."
+        ) from exc
+    if providers.video == "grok":
+        missing_tools = [
+            binary
+            for binary in (settings.ffmpeg_bin, settings.ffprobe_bin)
+            if shutil.which(binary) is None
+        ]
+        if missing_tools:
+            raise RuntimeError(
+                "Grok video duration conformance requires: "
+                + ", ".join(missing_tools)
+            )
+    return credentials
+
+
+def probe_visuals(
+    settings: Settings,
+    config: PipelineConfig,
+    *,
+    credentials: XAICredentials | None = None,
+) -> dict[str, Any]:
+    """Run one image and one I2V generation without state, queue, or Telegram."""
+    if config.imagine_call_cap < 2:
+        raise ImagineCallCapError(
+            "--probe-visuals requires an imagine_call_cap of at least 2"
+        )
+    resolved = credentials or resolve_xai_credentials(
+        api_key_env_value=settings.xai_api_key
+    )
+    calls = 0
+
+    def consume() -> None:
+        nonlocal calls
+        if calls >= config.imagine_call_cap:
+            raise ImagineCallCapError(
+                f"Probe reached its Grok Imagine call cap of {config.imagine_call_cap}"
+            )
+        calls += 1
+
+    output_dir = Path(tempfile.mkdtemp(prefix="framegate-grok-probe-"))
+    image_path = output_dir / "probe_frame.png"
+    raw_video_path = output_dir / ".probe_video.grok-raw.mp4"
+    video_path = output_dir / "probe_video.mp4"
+    with httpx.Client(
+        timeout=httpx.Timeout(settings.request_timeout, connect=15.0),
+        follow_redirects=True,
+    ) as client:
+        grok = GrokImagineClient(
+            resolved,
+            client,
+            request_timeout=settings.request_timeout,
+            poll_interval=settings.video_poll_interval,
+            poll_timeout=settings.video_poll_timeout,
+            retry_base_seconds=settings.retry_base_seconds,
+            consume_call=consume,
+        )
+        image_started = time.monotonic()
+        image = grok.generate_image(
+            "A simple cinematic red paper airplane centered in a clean blue "
+            "sky, vertical composition, no text or logos."
+        )
+        normalize_frame_bytes(image, image_path)
+        image_seconds = time.monotonic() - image_started
+
+        video_started = time.monotonic()
+        request_id = grok.start_image_to_video(
+            image_path,
+            "gentle slow push-in",
+            1.0,
+        )
+        completion = grok.poll_video(request_id)
+        try:
+            grok.download_video(completion, raw_video_path)
+            source_seconds, output_seconds = conform_video_duration(
+                raw_video_path,
+                video_path,
+                1.0,
+                ffmpeg_bin=settings.ffmpeg_bin,
+                ffprobe_bin=settings.ffprobe_bin,
+            )
+        finally:
+            raw_video_path.unlink(missing_ok=True)
+        video_seconds = time.monotonic() - video_started
+    return {
+        "image_path": str(image_path),
+        "video_path": str(video_path),
+        "timings_seconds": {
+            "image": round(image_seconds, 3),
+            "video": round(video_seconds, 3),
+            "total": round(image_seconds + video_seconds, 3),
+            "api_video": completion.duration_seconds,
+            "downloaded_video": round(source_seconds, 3),
+            "conformed_video": round(output_seconds, 3),
+        },
+    }
 
 
 def _frame_gate_summary(run: Mapping[str, Any]) -> dict[str, Any]:
@@ -3676,6 +4103,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     project_root = Path(__file__).resolve().parent
     load_environment(project_root)
+    if args.probe_visuals and (args.status or args.json):
+        parser.error("--probe-visuals cannot be combined with --status or --json")
     if args.status or args.json:
         database_path = args.db or Path(
             os.getenv("NEWS_PIPELINE_DB", project_root / "data" / "pipeline.sqlite3")
@@ -3701,10 +4130,33 @@ def main(argv: list[str] | None = None) -> int:
         database_path=args.db,
         work_root=args.work_root,
     )
+    try:
+        requested_providers = resolve_visual_providers(
+            preset,
+            visuals=args.visuals,
+            frames_provider=args.frames_provider,
+            video_provider=args.video_provider,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+    if args.probe_visuals:
+        try:
+            credentials = resolve_xai_credentials(
+                api_key_env_value=settings.xai_api_key
+            )
+            result = probe_visuals(settings, preset, credentials=credentials)
+        except (RuntimeError, ValueError) as exc:
+            LOG.error("Visual probe failed: %s", exc)
+            return 2
+        print(json.dumps(result, indent=2))
+        return 0
+    grok_credentials: XAICredentials | None = None
     if args.new:
         try:
-            validate_startup(settings, args.visuals, preset)
-        except RuntimeError as exc:
+            grok_credentials = validate_startup(
+                settings, requested_providers, preset
+            )
+        except (RuntimeError, ValueError) as exc:
             LOG.error("%s", exc)
             return 2
     store = StateStore(settings.database_path)
@@ -3715,19 +4167,21 @@ def main(argv: list[str] | None = None) -> int:
             topic=args.topic,
             new=args.new,
         )
-        run, preset, visuals, frame_gate = configure_run(
+        run, preset, providers, frame_gate = configure_run(
             store,
             run,
             config=preset,
             visuals=args.visuals,
+            frames_provider=args.frames_provider,
+            video_provider=args.video_provider,
             frame_gate=args.frame_gate,
             preset_path=args.config.expanduser().resolve(),
         )
     except ValueError as exc:
         parser.error(str(exc))
     try:
-        validate_startup(settings, visuals, preset)
-    except RuntimeError as exc:
+        grok_credentials = validate_startup(settings, providers, preset)
+    except (RuntimeError, ValueError) as exc:
         LOG.error("%s", exc)
         return 2
     pipeline = NewsPipeline(
@@ -3735,7 +4189,9 @@ def main(argv: list[str] | None = None) -> int:
         store,
         run,
         config=preset,
-        visuals=visuals,
+        frames_provider=providers.frames,
+        video_provider=providers.video,
+        grok_credentials=grok_credentials,
         frame_gate=frame_gate,
     )
     try:

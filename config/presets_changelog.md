@@ -1,5 +1,7 @@
 # Preset changelog
 
+- 2026-07-23 — Added independent `frames_provider` and `video_provider`
+  selection plus the persisted `imagine_call_cap` for the Grok Imagine lane.
 - 2026-07-20T02:12:03Z — Added `target_duration_seconds` (`unset` → `45`), `clip_padding` (`unset` → `0.4`), and `max_clip_seconds` (`unset` → `8.0`) for narration-driven timing.
 - 2026-07-20T02:54:41Z — Set `video_mode` (`i2v` → `auto`).
 - 2026-07-20T05:33:25Z — Set `style_block` (`Cinematic news documentary photography, realistic lighting. ` → `isometric voxel diorama, chunky cubic blocks, tilt-shift macro photography, soft studio lighting, vibrant color palette against dark clean background, highly detailed 3D render, shallow depth of field`) and appended `, photorealistic humans, realistic faces` to `negative_prompt`.

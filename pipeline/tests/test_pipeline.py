@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import importlib.util
+import io
 import json
 import logging
 import re
@@ -12,6 +13,10 @@ from pathlib import Path
 
 import httpx
 import pytest
+from PIL import Image
+
+from providers.grok_imagine import VideoCompletion
+from providers.xai_auth import XAICredentials
 
 import news_pipeline as module
 
@@ -1178,6 +1183,9 @@ def test_default_preset_loads_and_cli_defaults_local() -> None:
     assert preset.script_provider.model == "qwen3.6:35b-a3b"
     assert preset.script_provider.api_key_env is None
     assert preset.script_provider.timeout_seconds == 900
+    assert preset.frames_provider == "local"
+    assert preset.video_provider == "local"
+    assert preset.imagine_call_cap == 40
     assert preset.target_duration_seconds == 45
     assert preset.clip_padding == 0.4
     assert preset.max_clip_seconds == 6
@@ -1194,8 +1202,53 @@ def test_default_preset_loads_and_cli_defaults_local() -> None:
     )
     assert preset.narration_style == "Conversational, curious, direct, and warm."
     assert preset.voice == "narrator"
-    assert args.visuals == "local"
+    assert args.visuals is None
+    assert module.resolve_visual_providers(preset) == module.VisualProviders(
+        frames="local",
+        video="local",
+    )
     assert args.frame_gate is True
+
+
+@pytest.mark.parametrize(
+    ("visuals", "expected"),
+    [
+        ("local", module.VisualProviders("local", "local")),
+        ("cloud", module.VisualProviders("openai", "xai_key")),
+        ("grok", module.VisualProviders("grok", "grok")),
+    ],
+)
+def test_visual_shorthand_and_individual_override_precedence(
+    visuals: str,
+    expected: module.VisualProviders,
+) -> None:
+    preset = module.PipelineConfig()
+    assert module.resolve_visual_providers(preset, visuals=visuals) == expected
+    assert module.resolve_visual_providers(
+        preset,
+        visuals=visuals,
+        frames_provider="openai",
+        video_provider="local",
+    ) == module.VisualProviders("openai", "local")
+
+
+def test_invalid_grok_flf_provider_combination_fails_fast() -> None:
+    with pytest.raises(ValueError, match="video_provider=grok.*video_mode=flf"):
+        module.resolve_visual_providers(
+            module.PipelineConfig(video_mode="flf"),
+            visuals="grok",
+        )
+
+
+def test_imagine_call_cap_is_persisted_per_run(tmp_path: Path) -> None:
+    store = module.StateStore(tmp_path / "pipeline.sqlite3")
+    run = store.create_run("cap")
+
+    assert store.consume_imagine_call(run["id"], 2) == 1
+    assert store.consume_imagine_call(run["id"], 2) == 2
+    assert store.get_run(run["id"])["imagine_calls"] == 2
+    with pytest.raises(module.ImagineCallCapError, match="call cap of 2"):
+        store.consume_imagine_call(run["id"], 2)
 
 
 def test_voice_config_accepts_stock_and_named_voices() -> None:
@@ -1497,6 +1550,180 @@ def test_video_job_builder_matches_worker_contract(
         expected_frame_count,
         expected_frame_count / module.WAN_FPS,
     )
+
+
+def test_grok_lane_matches_local_cross_machine_artifact_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ContractQueue(RecordingQueue):
+        def wait(self, job_id, *, output_path, timeout):
+            submission = self._jobs[job_id]["submission"]
+            path = Path(output_path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if submission["job_type"] == "frame":
+                Image.new("RGB", (1080, 1920), "navy").save(path, format="PNG")
+            elif submission["job_type"] == "video":
+                path.write_bytes(b"local-video")
+            else:
+                return super().wait(job_id, output_path=output_path, timeout=timeout)
+            self._jobs[job_id]["status"] = "done"
+            return self._jobs[job_id]
+
+    class FakeGrok:
+        def __init__(self) -> None:
+            self.requested_durations: list[float] = []
+
+        def generate_image(self, _prompt: str) -> bytes:
+            output = io.BytesIO()
+            Image.new("RGB", (320, 240), "orange").save(output, format="PNG")
+            return output.getvalue()
+
+        def start_image_to_video(
+            self,
+            image_path: Path,
+            _prompt: str,
+            duration_seconds: float,
+        ) -> str:
+            assert image_path.name == "shot_01.png"
+            with Image.open(image_path) as image:
+                assert image.size == (1080, 1920)
+            self.requested_durations.append(duration_seconds)
+            return "grok-video-1"
+
+        def poll_video(self, request_id: str) -> VideoCompletion:
+            assert request_id == "grok-video-1"
+            return VideoCompletion(request_id, "https://media.test/clip.mp4", 5.0)
+
+        def download_video(
+            self,
+            _completion: VideoCompletion,
+            destination: Path,
+        ) -> None:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(b"raw-grok-video")
+
+    conformed_targets: list[float] = []
+
+    def fake_conform(
+        _source: Path,
+        destination: Path,
+        target_seconds: float,
+        **_kwargs,
+    ) -> tuple[float, float]:
+        conformed_targets.append(target_seconds)
+        destination.write_bytes(b"conformed-grok-video")
+        return 5.0, target_seconds
+
+    monkeypatch.setattr(module, "conform_video_duration", fake_conform)
+
+    shot = {
+        "voiceover_text": "A concise narration line.",
+        "motion_instruction": "slow push-in",
+        "video_mode": "i2v",
+        "first_frame_prompt": "A detailed opening frame",
+        "last_frame_prompt": None,
+    }
+    timing = module.clip_timing(
+        4.0,
+        clip_padding=0.4,
+        max_clip_seconds=6.0,
+    )
+
+    def prepared_pipeline(
+        root: Path,
+        *,
+        frames_provider: str,
+        video_provider: str,
+        queue: ContractQueue,
+    ) -> tuple[module.NewsPipeline, module.StateStore]:
+        config = settings(root)
+        store = module.StateStore(config.database_path)
+        run = store.create_run("contract")
+        run = store.update_run(
+            run["id"],
+            status="voiced",
+            script_json=json.dumps({"shots": [shot]}),
+            shot_audio_json=json.dumps(
+                {
+                    "version": 1,
+                    "shots": {
+                        "1": {
+                            "duration_seconds": 4.0,
+                            "timing": timing,
+                        }
+                    },
+                }
+            ),
+        )
+        pipeline = module.NewsPipeline(
+            config,
+            store,
+            run,
+            config=module.PipelineConfig(video_mode="i2v"),
+            frames_provider=frames_provider,
+            video_provider=video_provider,
+            grok_credentials=(
+                XAICredentials(bearer="test", source="test")
+                if "grok" in {frames_provider, video_provider}
+                else None
+            ),
+            frame_gate=False,
+            queue_client=queue,
+        )
+        return pipeline, store
+
+    local_queue = ContractQueue()
+    local, local_store = prepared_pipeline(
+        tmp_path / "local",
+        frames_provider="local",
+        video_provider="local",
+        queue=local_queue,
+    )
+    grok_queue = ContractQueue()
+    grok, grok_store = prepared_pipeline(
+        tmp_path / "grok",
+        frames_provider="grok",
+        video_provider="grok",
+        queue=grok_queue,
+    )
+    fake_grok = FakeGrok()
+    grok.grok = fake_grok
+    try:
+        local.generate_first_frames()
+        local.generate_clips()
+        grok.generate_first_frames()
+        grok.generate_clips()
+    finally:
+        local.close()
+        grok.close()
+
+    local_row = local_store.get_run(local.run_id)
+    grok_row = grok_store.get_run(grok.run_id)
+    local_frames = [Path(path) for path in json.loads(local_row["frames_json"])]
+    grok_frames = [Path(path) for path in json.loads(grok_row["frames_json"])]
+    local_clips = [Path(path) for path in json.loads(local_row["clips_json"])]
+    grok_clips = [Path(path) for path in json.loads(grok_row["clips_json"])]
+
+    assert [path.relative_to(local.run_dir) for path in local_frames] == [
+        path.relative_to(grok.run_dir) for path in grok_frames
+    ] == [Path("frames/shot_01.png")]
+    assert [path.relative_to(local.run_dir) for path in local_clips] == [
+        path.relative_to(grok.run_dir) for path in grok_clips
+    ] == [Path("clips/shot_01.mp4")]
+    for frame_path in [*local_frames, *grok_frames]:
+        with Image.open(frame_path) as image:
+            assert image.size == (1080, 1920)
+
+    local_video = next(
+        item for item in local_queue.submissions if item["job_type"] == "video"
+    )
+    assert local_video["payload"]["duration_seconds"] == timing["clip_seconds"]
+    assert fake_grok.requested_durations == [timing["clip_seconds"]]
+    assert conformed_targets == [timing["clip_seconds"]]
+    assert json.loads(local_row["shot_audio_json"])["shots"]["1"]["timing"] == json.loads(
+        grok_row["shot_audio_json"]
+    )["shots"]["1"]["timing"]
 
 
 def test_flf_uses_two_approved_frames_per_video(tmp_path: Path) -> None:
@@ -1822,14 +2049,14 @@ def test_run_configuration_is_snapshotted_for_resume(tmp_path: Path) -> None:
         fps_out=30,
         voice="narrator",
     )
-    run, _, visuals, frame_gate = module.configure_run(
+    run, _, providers, frame_gate = module.configure_run(
         store,
         run,
         config=first,
         visuals="local",
         frame_gate=False,
     )
-    _, resumed, resumed_visuals, resumed_gate = module.configure_run(
+    _, resumed, resumed_providers, resumed_gate = module.configure_run(
         store,
         run,
         config=module.PipelineConfig(style_block="CHANGED ", fps_out=60),
@@ -1837,7 +2064,7 @@ def test_run_configuration_is_snapshotted_for_resume(tmp_path: Path) -> None:
         frame_gate=True,
     )
 
-    assert visuals == "local"
+    assert providers == module.VisualProviders(frames="local", video="local")
     assert frame_gate is False
     assert resumed.style_block == "FIRST "
     assert resumed.fps_out == 30
@@ -1845,7 +2072,7 @@ def test_run_configuration_is_snapshotted_for_resume(tmp_path: Path) -> None:
     assert resumed.script_provider.model == "openai-test"
     assert resumed.script_provider.api_key_env == "OPENAI_API_KEY"
     assert resumed.voice == "narrator"
-    assert resumed_visuals == "local"
+    assert resumed_providers == providers
     assert resumed_gate is False
 
 
@@ -1914,4 +2141,120 @@ def test_cloud_cli_fails_before_creating_state_without_xai_key(
     )
 
     assert result == 2
+    assert not config.database_path.exists()
+
+
+def test_grok_cli_fails_auth_preflight_before_creating_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = replace(settings(tmp_path), xai_api_key="")
+    monkeypatch.setattr(module, "load_environment", lambda _: None)
+    monkeypatch.setattr(
+        module.Settings,
+        "from_environment",
+        classmethod(lambda cls, *args, **kwargs: config),
+    )
+    monkeypatch.setattr(
+        module,
+        "resolve_xai_credentials",
+        lambda **_kwargs: (_ for _ in ()).throw(module.XAIAuthError("re-auth Hermes")),
+    )
+
+    result = module.main(
+        [
+            "--new",
+            "--visuals",
+            "grok",
+            "--config",
+            str(module.DEFAULT_PRESET_PATH),
+        ]
+    )
+
+    assert result == 2
+    assert not config.database_path.exists()
+
+
+def test_switching_back_to_local_skips_xai_auth_resolution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        module,
+        "resolve_xai_credentials",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("must not resolve")),
+    )
+
+    assert (
+        module.validate_startup(
+            settings(tmp_path),
+            module.VisualProviders("local", "local"),
+            module.PipelineConfig(),
+        )
+        is None
+    )
+
+
+def test_probe_visuals_makes_one_image_and_one_i2v_call_without_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = {"image": 0, "video": 0, "poll": 0}
+
+    class ProbeGrok:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def generate_image(self, _prompt: str) -> bytes:
+            calls["image"] += 1
+            output = io.BytesIO()
+            Image.new("RGB", (64, 64), "red").save(output, format="PNG")
+            return output.getvalue()
+
+        def start_image_to_video(
+            self,
+            image_path: Path,
+            _prompt: str,
+            duration_seconds: float,
+        ) -> str:
+            calls["video"] += 1
+            assert image_path.is_file()
+            assert duration_seconds == 1.0
+            return "probe-request"
+
+        def poll_video(self, request_id: str) -> VideoCompletion:
+            calls["poll"] += 1
+            assert request_id == "probe-request"
+            return VideoCompletion(request_id, "https://media.test/probe.mp4", 1.0)
+
+        def download_video(
+            self,
+            _completion: VideoCompletion,
+            destination: Path,
+        ) -> None:
+            destination.write_bytes(b"raw-probe")
+
+    def fake_conform(
+        _source: Path,
+        destination: Path,
+        target_seconds: float,
+        **_kwargs,
+    ) -> tuple[float, float]:
+        destination.write_bytes(b"probe-video")
+        return 2.0, target_seconds
+
+    monkeypatch.setattr(module, "GrokImagineClient", ProbeGrok)
+    monkeypatch.setattr(module, "conform_video_duration", fake_conform)
+    config = settings(tmp_path)
+    result = module.probe_visuals(
+        config,
+        module.PipelineConfig(),
+        credentials=XAICredentials(bearer="test", source="test"),
+    )
+
+    assert calls == {"image": 1, "video": 1, "poll": 1}
+    assert Path(result["image_path"]).is_file()
+    assert Path(result["video_path"]).is_file()
+    assert result["timings_seconds"]["downloaded_video"] == 2.0
+    assert result["timings_seconds"]["conformed_video"] == 1.0
     assert not config.database_path.exists()

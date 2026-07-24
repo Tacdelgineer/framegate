@@ -15,8 +15,18 @@ cd /home/alireza/content-factory/pipeline
 
 The default script provider is the DGX Ollama OpenAI-compatible endpoint, and
 visuals default to the local DGX queue, so the default content path requires no
-model API key. To use `gpt-image-1` for frames and xAI Imagine for video, set
-`OPENAI_API_KEY` and `XAI_API_KEY` and run with `--visuals cloud`.
+model API key. `--visuals grok` uses Grok Imagine for both frames and
+image-to-video, reusing Hermes' existing xAI OAuth bearer when `XAI_API_KEY` is
+not set. `--visuals cloud` preserves the prior behavior: OpenAI frames plus
+the xAI API-key video lane.
+
+Cheap Grok credential/wire validation makes exactly one image generation and
+one image-to-video generation, writes both outputs to a temporary directory,
+prints paths and timings, and exits without SQLite, queue, or Telegram work:
+
+```bash
+./.venv/bin/python news_pipeline.py --probe-visuals
+```
 
 Resume the newest non-terminal run:
 
@@ -43,13 +53,38 @@ The frame gate is enabled by default. `--no-frame-gate` skips it.
 Every new run reads `../config/presets.yaml` and snapshots the resolved values
 in SQLite so a later edit cannot change a resumed run. The human-editable
 preset controls `target_duration_seconds`, `clip_padding`,
-`max_clip_seconds`, the verbatim frame-prompt `style_block`, local frame
-workflow, I2V/first-last-frame selection, resolution, draft/final steps,
-negative prompt, output FPS, and the independent OpenAI-compatible
-`script_provider`. The free-text `narration_style` is injected into the script
-prompt. `caption_style` controls caption enablement, size, base/highlight
-colors, and vertical position. `voice` selects `default` for the worker's stock
-voice or a named cloned-voice entry such as `narrator`.
+`max_clip_seconds`, the verbatim frame-prompt `style_block`, visual providers,
+the Grok call cap, local frame workflow, I2V/first-last-frame selection,
+resolution, draft/final steps, negative prompt, output FPS, and the independent
+OpenAI-compatible `script_provider`. The free-text `narration_style` is
+injected into the script prompt. `caption_style` controls caption enablement,
+size, base/highlight colors, and vertical position. `voice` selects `default`
+for the worker's stock voice or a named cloned-voice entry such as `narrator`.
+
+`frames_provider` accepts `local`, `openai`, or `grok`; `video_provider`
+accepts `local`, `xai_key`, or `grok`. Both default to `local`. CLI shorthand
+expands as follows:
+
+| CLI | Frames | Video |
+| --- | --- | --- |
+| `--visuals local` | `local` | `local` |
+| `--visuals grok` | `grok` | `grok` |
+| `--visuals cloud` | `openai` | `xai_key` |
+
+`--frames-provider` and `--video-provider` override their respective side of
+the shorthand. Grok video accepts one approved first frame, so
+`video_provider: grok` with `video_mode: flf` is rejected at startup; `auto`
+uses I2V for Grok. `imagine_call_cap` defaults to 40 and counts billable Grok
+POST attempts across the complete run, including regeneration and 429 retry
+attempts.
+
+When a Grok provider is selected, bearer resolution is `XAI_API_KEY` first,
+then Hermes' stored `xai-oauth` access token. Framegate mirrors Hermes'
+`HERMES_HOME`/profile auth path resolution; `HERMES_AUTH_PATH` can override the
+file explicitly. OAuth is subscription-backed and read-only from Hermes:
+Framegate never refreshes, rotates, or persists the grant. Missing or expired
+credentials fail during startup pre-flight with instructions to re-auth in
+Hermes.
 
 The script prompt requests enough 4–6-second narration shots to fill
 `target_duration_seconds` (nine shots at the 45-second default). TTS runs once
@@ -111,9 +146,11 @@ only that frame. Final-video Regenerate deletes generated media, rewinds to
   pipeline then burns the styled ASS track with ffmpeg's subtitles filter.
 
 Content-brief and script generation call the preset's OpenAI-compatible
-provider directly from the VPS. In local visual mode all five job types above
-use the queue; in cloud visual mode only TTS, transcription, and assembly use
-it.
+provider directly from the VPS. Provider selection is independent per visual
+stage. VPS-produced Grok/OpenAI frames keep the same run-relative names as
+local frames; Grok frames are normalized to 1080x1920 before the frame gate.
+VPS-produced clips keep `clips/shot_XX.mp4` and reuse the existing multipart
+assembly inputs to cross VPS→DGX. The DGX never receives the OAuth bearer.
 
 The queue client is imported from the sibling `../queue` directory by default.
 `JOB_QUEUE_CLIENT_ROOT` can override that location for development.
