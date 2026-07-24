@@ -53,8 +53,9 @@ The frame gate is enabled by default. `--no-frame-gate` skips it.
 
 Every new run reads `../config/presets.yaml` and snapshots the resolved values
 in SQLite so a later edit cannot change a resumed run. The human-editable
-preset controls `target_duration_seconds`, `clip_padding`,
-`max_clip_seconds`, the verbatim frame-prompt `style_block`, visual providers,
+preset controls `target_duration_seconds`, `narration_seconds_min`,
+`narration_seconds_max`, `clip_padding`, `max_clip_seconds`, the verbatim
+frame-prompt `style_block`, per-shot `motion_block`, visual providers,
 the Grok call cap, local frame workflow, I2V/first-last-frame selection,
 resolution, draft/final steps, negative prompt, output FPS, and the independent
 OpenAI-compatible `script_provider`. The free-text `narration_style` is
@@ -87,21 +88,28 @@ Framegate never refreshes, rotates, or persists the grant. Missing or expired
 credentials fail during startup pre-flight with instructions to re-auth in
 Hermes.
 
-The script prompt requests enough 4–6-second narration shots to fill
-`target_duration_seconds` (nine shots at the 45-second default). TTS runs once
-per shot before frame/video generation. Each clip requests the measured
+The script prompt requests enough narration shots to fill
+`target_duration_seconds`, using the midpoint of `narration_seconds_min` and
+`narration_seconds_max` for shot sizing (nine shots with the 4–6-second range
+and 45-second defaults). The same range appears in the prompt and clamps the
+per-shot TTS target. TTS runs once per shot before frame/video generation. Each
+clip requests the measured
 narration duration plus `clip_padding`, rounded up to Wan's `4n+1` frame shape
 at 16fps without exceeding `max_clip_seconds`. Narration over the cap gets one
 script-provider shortening retry; if it is still long, assembly holds the last
 video frame instead of cutting the audio.
 
-`script_provider` contains `base_url`, `model`, optional `api_key_env`, and an
-overall streaming-generation `timeout_seconds` ceiling (default 900 seconds).
-Use `https://api.x.ai/v1` with `XAI_API_KEY` for xAI, or
-`https://api.openai.com/v1` with `OPENAI_API_KEY` for OpenAI. A selected key
-environment variable must be configured before a run starts. `--visuals` does
-not select or alter the script provider. Script calls stream their response;
-`API_REQUEST_TIMEOUT` is applied to each period of network inactivity, while
+`script_provider.provider` accepts `configured` or `grok_oauth`.
+`grok_oauth` sends only `write_script` to xAI's Chat Completions endpoint with
+the read-only bearer resolved by the shared xAI auth path (`XAI_API_KEY` first,
+then Hermes OAuth). HTTP 403/429 falls back with a warning to the configured
+`base_url` and `model`, which default to local Qwen. Story drafting and
+narration-shortening retries always use that configured provider. Quota/usage
+response headers and body token/cost usage are logged around the Grok call.
+The optional `api_key_env` authenticates a configured hosted fallback, and
+`timeout_seconds` is the overall streaming-generation ceiling (default 900
+seconds). `--visuals` does not select or alter the script provider.
+`API_REQUEST_TIMEOUT` applies to each period of network inactivity, while
 thinking/output chunks keep an otherwise slow generation alive.
 
 ## State machine

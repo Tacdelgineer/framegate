@@ -446,6 +446,7 @@ def test_queue_job_reports_non_retryable_validation_for_the_shot(
 
 def test_narration_timing_rounds_to_wan_frames_and_honors_cap() -> None:
     assert module.target_shot_count(45) == 9
+    assert module.target_shot_count(45, 6, 8) == 7
 
     ordinary = module.clip_timing(
         5.1,
@@ -699,6 +700,192 @@ def test_script_provider_selection_uses_configured_endpoint_and_key(
     assert captured["url"] == f"{base_url}/chat/completions"
     assert captured["authorization"] == f"Bearer {api_key}"
     assert captured["payload"]["model"] == model
+
+
+def test_grok_oauth_is_used_for_write_script_chat_only_and_logs_quota(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(
+            {
+                "url": str(request.url),
+                "authorization": request.headers.get("Authorization"),
+                "payload": json.loads(request.content),
+            }
+        )
+        is_grok = request.url.host == "api.x.ai"
+        return httpx.Response(
+            200,
+            headers=(
+                {
+                    "x-ratelimit-remaining-tokens": "9950",
+                    "x-usage-weekly-percent": "12.5",
+                }
+                if is_grok
+                else {}
+            ),
+            json={
+                "choices": [{"message": {"content": '{"ok": true}'}}],
+                "usage": {
+                    "prompt_tokens": 40,
+                    "completion_tokens": 10,
+                    "total_tokens": 50,
+                    "cost_in_usd_ticks": 1234,
+                },
+            },
+        )
+
+    config = settings(tmp_path)
+    store = module.StateStore(config.database_path)
+    run = store.create_run("test")
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    pipeline = module.NewsPipeline(
+        config,
+        store,
+        run,
+        config=module.PipelineConfig(
+            script_provider=module.ScriptProviderConfig(provider="grok_oauth")
+        ),
+        grok_credentials=XAICredentials(
+            bearer="oauth-selected",
+            source="test",
+            base_url="https://api.x.ai/v1",
+        ),
+        http_client=client,
+        queue_client=FakeQueue(),
+    )
+    try:
+        with caplog.at_level(logging.INFO, logger="news_pipeline"):
+            grok_result, _ = pipeline._write_script_chat(
+                system_prompt="Return JSON.",
+                user_prompt="Write the script.",
+            )
+            local_result, _ = pipeline._script_chat(
+                system_prompt="Return JSON.",
+                user_prompt="Shorten this narration.",
+            )
+    finally:
+        pipeline.close()
+        client.close()
+
+    assert grok_result == local_result == {"ok": True}
+    assert requests[0]["url"] == "https://api.x.ai/v1/chat/completions"
+    assert requests[0]["authorization"] == "Bearer oauth-selected"
+    assert requests[0]["payload"]["model"] == module.DEFAULT_GROK_SCRIPT_MODEL
+    assert requests[1]["url"] == ("http://100.103.129.82:11434/v1/chat/completions")
+    assert requests[1]["authorization"] is None
+    assert requests[1]["payload"]["model"] == "qwen3.6:35b-a3b"
+    assert "quota/usage response headers before call: {}" in caplog.text
+    assert '"x-ratelimit-remaining-tokens": "9950"' in caplog.text
+    assert '"x-usage-weekly-percent": "12.5"' in caplog.text
+    assert "cost_in_usd_ticks=1234" in caplog.text
+
+
+@pytest.mark.parametrize("status_code", [403, 429])
+def test_grok_oauth_write_script_falls_back_to_local_qwen(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    status_code: int,
+) -> None:
+    urls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        urls.append(str(request.url))
+        if request.url.host == "api.x.ai":
+            return httpx.Response(
+                status_code,
+                headers={"x-quota-remaining": "0"},
+                json={"error": "shared pool unavailable"},
+            )
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": '{"fallback": true}'}}]},
+        )
+
+    config = settings(tmp_path)
+    store = module.StateStore(config.database_path)
+    run = store.create_run("test")
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    pipeline = module.NewsPipeline(
+        config,
+        store,
+        run,
+        config=module.PipelineConfig(
+            script_provider=module.ScriptProviderConfig(provider="grok_oauth")
+        ),
+        grok_credentials=XAICredentials(
+            bearer="oauth-selected",
+            source="test",
+            base_url="https://api.x.ai/v1",
+        ),
+        http_client=client,
+        queue_client=FakeQueue(),
+    )
+    try:
+        with caplog.at_level(logging.INFO, logger="news_pipeline"):
+            result, _ = pipeline._write_script_chat(
+                system_prompt="Return JSON.",
+                user_prompt="Write the script.",
+            )
+    finally:
+        pipeline.close()
+        client.close()
+
+    assert result == {"fallback": True}
+    assert urls == [
+        "https://api.x.ai/v1/chat/completions",
+        "http://100.103.129.82:11434/v1/chat/completions",
+    ]
+    assert f"returned HTTP {status_code}; falling back" in caplog.text
+    assert 'quota/usage response headers after call: {"x-quota-remaining": "0"}' in (
+        caplog.text
+    )
+
+
+def test_grok_oauth_write_script_does_not_fallback_on_other_errors(
+    tmp_path: Path,
+) -> None:
+    requests = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        return httpx.Response(500, json={"error": "upstream failure"})
+
+    config = settings(tmp_path)
+    store = module.StateStore(config.database_path)
+    run = store.create_run("test")
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    pipeline = module.NewsPipeline(
+        config,
+        store,
+        run,
+        config=module.PipelineConfig(
+            script_provider=module.ScriptProviderConfig(provider="grok_oauth")
+        ),
+        grok_credentials=XAICredentials(
+            bearer="oauth-selected",
+            source="test",
+            base_url="https://api.x.ai/v1",
+        ),
+        http_client=client,
+        queue_client=FakeQueue(),
+    )
+    try:
+        with pytest.raises(module.ScriptProviderHTTPError) as exc_info:
+            pipeline._write_script_chat(
+                system_prompt="Return JSON.",
+                user_prompt="Write the script.",
+            )
+    finally:
+        pipeline.close()
+        client.close()
+
+    assert exc_info.value.status_code == 500
+    assert requests == 1
 
 
 def test_script_chat_streams_chunks_strips_thinking_and_logs_usage(
@@ -1040,6 +1227,41 @@ def test_per_shot_tts_state_resumes_without_requeue(tmp_path: Path) -> None:
     assert module.wav_duration_seconds(Path(saved["voiceover_path"])) == 30.5
 
 
+def test_tts_target_uses_configured_narration_clamp(tmp_path: Path) -> None:
+    config = settings(tmp_path)
+    store = module.StateStore(config.database_path)
+    run = store.create_run("test")
+    shots = [{"voiceover_text": f"Voice {index}"} for index in range(1, 8)]
+    run = store.update_run(
+        run["id"],
+        status="scripted",
+        script_json=json.dumps({"shots": shots}),
+    )
+    queue = RecordingQueue()
+    pipeline = module.NewsPipeline(
+        config,
+        store,
+        run,
+        config=module.PipelineConfig(
+            target_duration_seconds=45,
+            narration_seconds_min=6,
+            narration_seconds_max=8,
+        ),
+        queue_client=queue,
+    )
+    try:
+        pipeline.generate_voiceover_and_captions()
+    finally:
+        pipeline.close()
+
+    tts_jobs = [job for job in queue.submissions if job["job_type"] == "tts"]
+    assert len(tts_jobs) == 7
+    assert all(
+        job["payload"]["target_duration_seconds"] == pytest.approx(45 / 7)
+        for job in tts_jobs
+    )
+
+
 def test_disabled_captions_skip_transcription(tmp_path: Path) -> None:
     config = settings(tmp_path)
     store = module.StateStore(config.database_path)
@@ -1178,6 +1400,7 @@ def test_default_preset_loads_and_cli_defaults_local() -> None:
     preset = module.PipelineConfig.load(module.DEFAULT_PRESET_PATH)
     args = module.build_parser().parse_args([])
 
+    assert preset.script_provider.provider == "grok_oauth"
     assert preset.script_provider.base_url == "http://100.103.129.82:11434/v1"
     assert preset.script_provider.model == "qwen3.6:35b-a3b"
     assert preset.script_provider.api_key_env is None
@@ -1186,8 +1409,11 @@ def test_default_preset_loads_and_cli_defaults_local() -> None:
     assert preset.video_provider == "local"
     assert preset.imagine_call_cap == 40
     assert preset.target_duration_seconds == 45
+    assert preset.narration_seconds_min == 4
+    assert preset.narration_seconds_max == 6
     assert preset.clip_padding == 0.4
     assert preset.max_clip_seconds == 6
+    assert preset.motion_block == module.DEFAULT_MOTION_BLOCK
     assert preset.frame_model == "flux2_klein"
     assert preset.video_mode == "auto"
     assert preset.video_resolution == "720x1280"
@@ -1704,12 +1930,16 @@ def test_grok_lane_matches_local_cross_machine_artifact_contract(
     local_clips = [Path(path) for path in json.loads(local_row["clips_json"])]
     grok_clips = [Path(path) for path in json.loads(grok_row["clips_json"])]
 
-    assert [path.relative_to(local.run_dir) for path in local_frames] == [
-        path.relative_to(grok.run_dir) for path in grok_frames
-    ] == [Path("frames/shot_01.png")]
-    assert [path.relative_to(local.run_dir) for path in local_clips] == [
-        path.relative_to(grok.run_dir) for path in grok_clips
-    ] == [Path("clips/shot_01.mp4")]
+    assert (
+        [path.relative_to(local.run_dir) for path in local_frames]
+        == [path.relative_to(grok.run_dir) for path in grok_frames]
+        == [Path("frames/shot_01.png")]
+    )
+    assert (
+        [path.relative_to(local.run_dir) for path in local_clips]
+        == [path.relative_to(grok.run_dir) for path in grok_clips]
+        == [Path("clips/shot_01.mp4")]
+    )
     for frame_path in [*local_frames, *grok_frames]:
         with Image.open(frame_path) as image:
             assert image.size == (1080, 1920)
@@ -1720,9 +1950,10 @@ def test_grok_lane_matches_local_cross_machine_artifact_contract(
     assert local_video["payload"]["duration_seconds"] == timing["clip_seconds"]
     assert fake_grok.requested_durations == [timing["clip_seconds"]]
     assert conformed_targets == [timing["clip_seconds"]]
-    assert json.loads(local_row["shot_audio_json"])["shots"]["1"]["timing"] == json.loads(
-        grok_row["shot_audio_json"]
-    )["shots"]["1"]["timing"]
+    assert (
+        json.loads(local_row["shot_audio_json"])["shots"]["1"]["timing"]
+        == json.loads(grok_row["shot_audio_json"])["shots"]["1"]["timing"]
+    )
 
 
 def test_flf_uses_two_approved_frames_per_video(tmp_path: Path) -> None:
@@ -1915,7 +2146,8 @@ def test_frame_album_and_controls_are_not_resent_after_restart(
 
 def test_script_normalizes_motion_mode_and_verbatim_style(tmp_path: Path) -> None:
     style = "ARCHIVAL COLLAGE — "
-    shot_count = module.target_shot_count(45)
+    motion = "Favor a slow pull-back while keeping exactly one camera move."
+    shot_count = module.target_shot_count(45, 6, 8)
     response_script = {
         "title": "Title",
         "description": "Description",
@@ -1952,7 +2184,13 @@ def test_script_normalizes_motion_mode_and_verbatim_style(tmp_path: Path) -> Non
         config,
         store,
         run,
-        config=module.PipelineConfig(style_block=style, video_mode="auto"),
+        config=module.PipelineConfig(
+            style_block=style,
+            motion_block=motion,
+            narration_seconds_min=6,
+            narration_seconds_max=8,
+            video_mode="auto",
+        ),
         visuals="cloud",
         frame_gate=False,
         http_client=client,
@@ -1969,9 +2207,10 @@ def test_script_normalizes_motion_mode_and_verbatim_style(tmp_path: Path) -> Non
     assert all(shot["motion_instruction"] == "slow push-in" for shot in script["shots"])
     prompt = request_payload["messages"][1]["content"]
     assert f"Exactly {shot_count} shots" in prompt
-    assert "4-6 second range" in prompt
+    assert "6-8 second range" in prompt
     assert "about 45 seconds" in prompt
-    assert "Exactly one short camera move" in prompt
+    assert motion in prompt
+    assert "Follow the MOTION BLOCK exactly" in prompt
     assert "Write for the ear, not the page" in prompt
     assert "Keep every narration sentence under 12 words" in prompt
     assert 'Use second person ("you")' in prompt
@@ -2045,6 +2284,9 @@ def test_run_configuration_is_snapshotted_for_resume(tmp_path: Path) -> None:
             api_key_env="OPENAI_API_KEY",
         ),
         style_block="FIRST ",
+        motion_block="FIRST MOTION",
+        narration_seconds_min=6,
+        narration_seconds_max=8,
         fps_out=30,
         voice="narrator",
     )
@@ -2066,6 +2308,9 @@ def test_run_configuration_is_snapshotted_for_resume(tmp_path: Path) -> None:
     assert providers == module.VisualProviders(frames="local", video="local")
     assert frame_gate is False
     assert resumed.style_block == "FIRST "
+    assert resumed.motion_block == "FIRST MOTION"
+    assert resumed.narration_seconds_min == 6
+    assert resumed.narration_seconds_max == 8
     assert resumed.fps_out == 30
     assert resumed.script_provider.base_url == "https://api.openai.com/v1"
     assert resumed.script_provider.model == "openai-test"
@@ -2115,6 +2360,35 @@ def test_script_provider_key_requirement_is_independent_of_visuals(
         module.validate_startup(config, "local", xai_script)
 
     module.validate_startup(config, "local", openai_script)
+
+
+def test_grok_oauth_script_provider_preflights_read_only_credentials(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = replace(settings(tmp_path), xai_api_key="preferred-xai-key")
+    expected = XAICredentials(
+        bearer="resolved",
+        source="XAI_API_KEY",
+        base_url="https://api.x.ai/v1",
+    )
+    captured = {}
+
+    def resolve(**kwargs):
+        captured.update(kwargs)
+        return expected
+
+    monkeypatch.setattr(module, "resolve_xai_credentials", resolve)
+    result = module.validate_startup(
+        config,
+        module.VisualProviders("local", "local"),
+        module.PipelineConfig(
+            script_provider=module.ScriptProviderConfig(provider="grok_oauth")
+        ),
+    )
+
+    assert result is expected
+    assert captured == {"api_key_env_value": "preferred-xai-key"}
 
 
 def test_cloud_cli_fails_before_creating_state_without_xai_key(

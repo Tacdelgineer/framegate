@@ -49,7 +49,7 @@ flowchart LR
     end
 
     subgraph DGX["DGX aitopatom-c85a · 100.103.129.82"]
-        L["Ollama :11434<br/>Qwen content brief + script"]
+        L["Ollama :11434<br/>Qwen brief, retries, and script fallback"]
         W["Polling worker<br/>frame → video → tts → transcribe → assemble"]
     end
 
@@ -82,7 +82,7 @@ gates remain on the VPS.
 | Stage | Machine | Provider/model | Notes |
 | --- | --- | --- | --- |
 | Evergreen content brief | DGX via VPS | Ollama `qwen3.6:35b-a3b` | Default keyless OpenAI-compatible chat completions |
-| Narration-timed script | DGX via VPS | Ollama `qwen3.6:35b-a3b` | Enough 4–6-second shots for the preset target duration; hosted provider optional |
+| Narration-timed script | VPS, with DGX fallback | xAI OAuth `grok-build-0.1`; Ollama `qwen3.6:35b-a3b` fallback | Configurable per-shot narration range; only `write_script` uses xAI, with local fallback on HTTP 403/429 |
 | Frames (local default) | DGX | preset `flux2_klein` workflow | One I2V frame or first/last pair per shot |
 | Frames (OpenAI) | VPS | OpenAI `gpt-image-1` | 9:16 images |
 | Frames (Grok) | VPS | xAI `grok-imagine-image` | Requested as 9:16 and center-cropped/upscaled to the local 1080x1920 PNG contract |

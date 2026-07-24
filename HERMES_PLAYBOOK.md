@@ -212,10 +212,12 @@ improvise.
 ## Presets tier
 
 Edit presets only when the user asks for a style, model, or setting change.
-Limit changes to `script_provider.base_url`, `script_provider.model`,
+Limit changes to `script_provider.provider`, `script_provider.base_url`,
+`script_provider.model`,
 `script_provider.api_key_env`, `script_provider.timeout_seconds`,
-`target_duration_seconds`, `clip_padding`,
-`max_clip_seconds`, `style_block`, `frame_model`, `video_mode`,
+`target_duration_seconds`, `narration_seconds_min`, `narration_seconds_max`,
+`clip_padding`, `max_clip_seconds`, `style_block`, `motion_block`,
+`frame_model`, `video_mode`,
 `video_resolution`, `steps_draft`, `steps_final`, `fps_out`, and
 `negative_prompt`; `caption_style.captions_enabled`,
 `caption_style.font_size`, `caption_style.base_color`,
@@ -224,8 +226,10 @@ Limit changes to `script_provider.base_url`, `script_provider.model`,
 voice or to a named cloned-voice registry entry. Caption colors use `#RRGGBB`;
 caption position is the percent of frame height above the bottom edge. The
 script provider is independent of `--visuals`; changing one never implies
-changing the other. Use `api_key_env: null` for keyless Ollama, `XAI_API_KEY`
-for xAI, or `OPENAI_API_KEY` for OpenAI.
+changing the other. Use `provider: grok_oauth` to send only `write_script` to
+xAI OAuth, with the configured endpoint/model as its HTTP 403/429 fallback.
+Use `api_key_env: null` for keyless Ollama, `XAI_API_KEY` for xAI, or
+`OPENAI_API_KEY` for OpenAI.
 
 1. Read `/home/alireza/content-factory/config/presets.yaml`.
 2. Prepare a before/after unified diff without writing any file.
@@ -266,14 +270,21 @@ snapshot these values from
 original snapshot:
 
 - `target_duration_seconds` (default `45`) tells the script stage how much
-  narration to write. It requests enough shots with roughly 4–6 seconds of
-  narration each.
+  narration to write.
+- `narration_seconds_min` and `narration_seconds_max` (defaults `4` and `6`)
+  set the per-shot range used for shot sizing, the script prompt, and the TTS
+  duration target.
 - `clip_padding` (default `0.4`) is added to each measured narration segment
   before its video length is calculated.
 - `max_clip_seconds` (currently `6.0`) caps each requested clip.
 - `caption_style` controls whether captions are enabled and their font size,
   base/highlight colors, and bottom-safe vertical position.
 - `narration_style` is free-text tone guidance injected into the script prompt.
+- `motion_block` is free-text per-shot camera/motion guidance injected into
+  the script prompt.
+- `script_provider.provider` selects `configured` or `grok_oauth`. Grok OAuth
+  applies only to `write_script`; story drafting and shortening retries use
+  the configured endpoint, which is also the HTTP 403/429 fallback.
 - `script_provider.timeout_seconds` (default `900`) is the overall ceiling for
   a streaming script generation; the API request timeout remains a per-chunk
   inactivity limit.

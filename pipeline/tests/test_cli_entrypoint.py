@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import shlex
 import subprocess
+import sys
 from pathlib import Path
 
 
@@ -50,3 +51,20 @@ def test_factory_ops_probe_entrypoint_help_from_repo_root() -> None:
     assert "--probe-visuals" in result.stdout
     assert "--frames-provider" in result.stdout
     assert "--video-provider" in result.stdout
+
+
+def test_python_module_help_guards_real_pipeline_entrypoint() -> None:
+    result = subprocess.run(
+        [sys.executable, "-m", "pipeline.news_pipeline", "--help"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "Create a crash-resumable, narration-timed vertical explainer" in (
+        result.stdout
+    )
+    assert "--config" in result.stdout

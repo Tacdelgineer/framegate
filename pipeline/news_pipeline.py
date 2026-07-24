@@ -81,8 +81,8 @@ TERMINAL_STATUSES = {"published", "rejected"}
 WAN_FPS = 16
 WAN_FRAME_STRIDE = 4
 WAN_FRAME_OFFSET = 1
-NARRATION_SECONDS_MIN = 4.0
-NARRATION_SECONDS_MAX = 6.0
+DEFAULT_NARRATION_SECONDS_MIN = 4.0
+DEFAULT_NARRATION_SECONDS_MAX = 6.0
 ASSEMBLY_TAIL_SECONDS = 0.5
 TELEGRAM_MEDIA_GROUP_LIMIT = 10
 
@@ -101,10 +101,17 @@ VISUAL_SHORTHANDS = {
 VISUAL_BACKENDS = set(VISUAL_SHORTHANDS)
 VIDEO_MODES = {"i2v", "flf", "auto"}
 DEFAULT_STYLE_BLOCK = "Cinematic news documentary photography, realistic lighting. "
+DEFAULT_MOTION_BLOCK = (
+    "Exactly one short camera move per motion_instruction (for example "
+    '"slow push-in", "gentle pan left", or "static locked-off"); do not '
+    "combine moves."
+)
 DEFAULT_NARRATION_STYLE = "Conversational, curious, direct, and warm."
 DEFAULT_SCRIPT_BASE_URL = "http://100.103.129.82:11434/v1"
 DEFAULT_SCRIPT_MODEL = "qwen3.6:35b-a3b"
 DEFAULT_SCRIPT_TIMEOUT_SECONDS = 900.0
+DEFAULT_GROK_SCRIPT_MODEL = "grok-build-0.1"
+SCRIPT_PROVIDERS = {"configured", "grok_oauth"}
 DEFAULT_VOICE = "default"
 
 VOICE_PRESETS = {
@@ -209,9 +216,16 @@ def atomic_write_bytes(path: Path, content: bytes) -> None:
         partial.unlink(missing_ok=True)
 
 
-def target_shot_count(target_duration_seconds: float) -> int:
-    """Aim for roughly five seconds of narration per shot."""
-    return max(1, math.ceil(target_duration_seconds / 5.0))
+def target_shot_count(
+    target_duration_seconds: float,
+    narration_seconds_min: float = DEFAULT_NARRATION_SECONDS_MIN,
+    narration_seconds_max: float = DEFAULT_NARRATION_SECONDS_MAX,
+) -> int:
+    """Size the shot list from the configured narration-range midpoint."""
+    midpoint = (narration_seconds_min + narration_seconds_max) / 2.0
+    if midpoint <= 0:
+        raise ValueError("Narration duration midpoint must be positive")
+    return max(1, math.ceil(target_duration_seconds / midpoint))
 
 
 def wan_frame_count(
@@ -429,6 +443,7 @@ def assembly_timing(
 
 @dataclass(frozen=True)
 class ScriptProviderConfig:
+    provider: str = "configured"
     base_url: str = DEFAULT_SCRIPT_BASE_URL
     model: str = DEFAULT_SCRIPT_MODEL
     api_key_env: str | None = None
@@ -443,6 +458,7 @@ class ScriptProviderConfig:
                 "Unknown script_provider keys: " + ", ".join(sorted(unknown))
             )
         config = cls(
+            provider=values.get("provider", "configured"),
             base_url=values.get("base_url", DEFAULT_SCRIPT_BASE_URL),
             model=values.get("model", DEFAULT_SCRIPT_MODEL),
             api_key_env=values.get("api_key_env"),
@@ -454,6 +470,11 @@ class ScriptProviderConfig:
         return config
 
     def validate(self) -> None:
+        if self.provider not in SCRIPT_PROVIDERS:
+            raise ValueError(
+                "script_provider.provider must be one of: "
+                + ", ".join(sorted(SCRIPT_PROVIDERS))
+            )
         for name in ("base_url", "model"):
             if not isinstance(getattr(self, name), str) or not getattr(self, name):
                 raise ValueError(f"script_provider.{name} must be a non-empty string")
@@ -474,6 +495,7 @@ class ScriptProviderConfig:
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "provider": self.provider,
             "base_url": self.base_url,
             "model": self.model,
             "api_key_env": self.api_key_env,
@@ -553,9 +575,12 @@ class PipelineConfig:
     video_provider: str = "local"
     imagine_call_cap: int = 40
     target_duration_seconds: float = 45.0
+    narration_seconds_min: float = DEFAULT_NARRATION_SECONDS_MIN
+    narration_seconds_max: float = DEFAULT_NARRATION_SECONDS_MAX
     clip_padding: float = 0.4
     max_clip_seconds: float = 8.0
     style_block: str = DEFAULT_STYLE_BLOCK
+    motion_block: str = DEFAULT_MOTION_BLOCK
     frame_model: str = "flux2_klein"
     video_mode: str = "i2v"
     video_resolution: str = "720p"
@@ -588,9 +613,12 @@ class PipelineConfig:
             video_provider=merged["video_provider"],
             imagine_call_cap=merged["imagine_call_cap"],
             target_duration_seconds=merged["target_duration_seconds"],
+            narration_seconds_min=merged["narration_seconds_min"],
+            narration_seconds_max=merged["narration_seconds_max"],
             clip_padding=merged["clip_padding"],
             max_clip_seconds=merged["max_clip_seconds"],
             style_block=merged["style_block"],
+            motion_block=merged["motion_block"],
             frame_model=merged["frame_model"],
             video_mode=merged["video_mode"],
             video_resolution=merged["video_resolution"],
@@ -622,13 +650,11 @@ class PipelineConfig:
         self.caption_style.validate()
         if self.frames_provider not in FRAME_PROVIDERS:
             raise ValueError(
-                "frames_provider must be one of: "
-                + ", ".join(sorted(FRAME_PROVIDERS))
+                "frames_provider must be one of: " + ", ".join(sorted(FRAME_PROVIDERS))
             )
         if self.video_provider not in VIDEO_PROVIDERS:
             raise ValueError(
-                "video_provider must be one of: "
-                + ", ".join(sorted(VIDEO_PROVIDERS))
+                "video_provider must be one of: " + ", ".join(sorted(VIDEO_PROVIDERS))
             )
         if (
             isinstance(self.imagine_call_cap, bool)
@@ -636,7 +662,12 @@ class PipelineConfig:
             or self.imagine_call_cap <= 0
         ):
             raise ValueError("imagine_call_cap must be a positive integer")
-        for name in ("style_block", "frame_model", "video_resolution"):
+        for name in (
+            "style_block",
+            "motion_block",
+            "frame_model",
+            "video_resolution",
+        ):
             if not isinstance(getattr(self, name), str) or not getattr(self, name):
                 raise ValueError(f"{name} must be a non-empty string")
         if not isinstance(self.negative_prompt, str):
@@ -655,6 +686,8 @@ class PipelineConfig:
             )
         for name in (
             "target_duration_seconds",
+            "narration_seconds_min",
+            "narration_seconds_max",
             "clip_padding",
             "max_clip_seconds",
         ):
@@ -663,6 +696,13 @@ class PipelineConfig:
                 raise ValueError(f"{name} must be a number")
         if self.target_duration_seconds <= 0:
             raise ValueError("target_duration_seconds must be positive")
+        if self.narration_seconds_min <= 0:
+            raise ValueError("narration_seconds_min must be positive")
+        if self.narration_seconds_max < self.narration_seconds_min:
+            raise ValueError(
+                "narration_seconds_max must be greater than or equal to "
+                "narration_seconds_min"
+            )
         if self.clip_padding < 0:
             raise ValueError("clip_padding must be non-negative")
         if self.max_clip_seconds <= 0:
@@ -681,9 +721,12 @@ class PipelineConfig:
             "video_provider": self.video_provider,
             "imagine_call_cap": self.imagine_call_cap,
             "target_duration_seconds": self.target_duration_seconds,
+            "narration_seconds_min": self.narration_seconds_min,
+            "narration_seconds_max": self.narration_seconds_max,
             "clip_padding": self.clip_padding,
             "max_clip_seconds": self.max_clip_seconds,
             "style_block": self.style_block,
+            "motion_block": self.motion_block,
             "frame_model": self.frame_model,
             "video_mode": self.video_mode,
             "video_resolution": self.video_resolution,
@@ -705,13 +748,11 @@ class VisualProviders:
     def validate(self, config: PipelineConfig) -> None:
         if self.frames not in FRAME_PROVIDERS:
             raise ValueError(
-                "frames provider must be one of: "
-                + ", ".join(sorted(FRAME_PROVIDERS))
+                "frames provider must be one of: " + ", ".join(sorted(FRAME_PROVIDERS))
             )
         if self.video not in VIDEO_PROVIDERS:
             raise ValueError(
-                "video provider must be one of: "
-                + ", ".join(sorted(VIDEO_PROVIDERS))
+                "video provider must be one of: " + ", ".join(sorted(VIDEO_PROVIDERS))
             )
         if self.video == "grok" and config.video_mode == "flf":
             raise ValueError(
@@ -1483,6 +1524,26 @@ class RemoteAPIError(RuntimeError):
     pass
 
 
+class ScriptProviderHTTPError(RemoteAPIError):
+    def __init__(self, status_code: int, detail: str):
+        super().__init__(
+            f"Script provider returned HTTP {status_code}: {detail or 'no detail'}"
+        )
+        self.status_code = status_code
+
+
+def quota_usage_response_headers(headers: Mapping[str, str]) -> dict[str, str]:
+    """Keep quota/usage telemetry while excluding unrelated response headers."""
+    markers = ("quota", "usage", "ratelimit", "rate-limit", "remaining", "reset")
+    selected = {
+        key.lower(): value
+        for key, value in headers.items()
+        if key.lower() == "retry-after"
+        or any(marker in key.lower() for marker in markers)
+    }
+    return dict(sorted(selected.items()))
+
+
 class NonRetryableWorkerError(RuntimeError):
     """A deterministic worker rejection that stage retries cannot repair."""
 
@@ -1551,13 +1612,21 @@ class NewsPipeline:
             request_timeout=settings.request_timeout,
         )
         self._owns_queue = queue_client is None
-        self.grok: GrokImagineClient | None = None
-        if "grok" in {self.frames_provider, self.video_provider}:
-            credentials = grok_credentials or resolve_xai_credentials(
+        self.grok_credentials: XAICredentials | None = None
+        self._last_xai_script_quota_headers: dict[str, str] = {}
+        if self.config.script_provider.provider == "grok_oauth" or "grok" in {
+            self.frames_provider,
+            self.video_provider,
+        }:
+            self.grok_credentials = grok_credentials or resolve_xai_credentials(
                 api_key_env_value=settings.xai_api_key
             )
+        self.grok: GrokImagineClient | None = None
+        if "grok" in {self.frames_provider, self.video_provider}:
+            if self.grok_credentials is None:
+                raise RuntimeError("Grok credentials were not resolved")
             self.grok = GrokImagineClient(
-                credentials,
+                self.grok_credentials,
                 self.http,
                 request_timeout=settings.request_timeout,
                 poll_interval=settings.video_poll_interval,
@@ -1613,8 +1682,12 @@ class NewsPipeline:
         *,
         system_prompt: str,
         user_prompt: str,
+        provider_override: ScriptProviderConfig | None = None,
+        bearer: str = "",
+        provider_label: str = "configured",
+        log_xai_quota: bool = False,
     ) -> tuple[Any, dict[str, Any]]:
-        provider = self.config.script_provider
+        provider = provider_override or self.config.script_provider
         payload: dict[str, Any] = {
             "model": provider.model,
             "messages": [
@@ -1627,7 +1700,9 @@ class NewsPipeline:
             "stream_options": {"include_usage": True},
         }
         headers = {}
-        if provider.api_key_env:
+        if bearer:
+            headers["Authorization"] = f"Bearer {bearer}"
+        elif provider.api_key_env:
             api_key = script_provider_api_key(self.settings, provider)
             if not api_key:
                 raise RuntimeError(
@@ -1647,6 +1722,12 @@ class NewsPipeline:
         usage: dict[str, Any] = {}
         content_parts: list[str] = []
         response_metadata: dict[str, Any] = {}
+        response_quota_headers: dict[str, str] = {}
+        if log_xai_quota:
+            LOG.info(
+                "xAI script quota/usage response headers before call: %s",
+                json.dumps(self._last_xai_script_quota_headers, sort_keys=True),
+            )
         try:
             with self.http.stream(
                 "POST",
@@ -1655,11 +1736,19 @@ class NewsPipeline:
                 json=payload,
                 timeout=request_timeout,
             ) as response:
+                if log_xai_quota:
+                    response_quota_headers = quota_usage_response_headers(
+                        response.headers
+                    )
+                    LOG.info(
+                        "xAI script quota/usage response headers at stream start: %s",
+                        json.dumps(response_quota_headers, sort_keys=True),
+                    )
                 if response.is_error:
                     response.read()
-                    self._response_json(
-                        response,
-                        "Script provider Chat Completions",
+                    raise ScriptProviderHTTPError(
+                        response.status_code,
+                        response.text[:1500].strip(),
                     )
                 for line in response.iter_lines():
                     elapsed = time.monotonic() - started
@@ -1731,18 +1820,72 @@ class NewsPipeline:
             status = "succeeded"
             return parsed, data
         finally:
+            if log_xai_quota:
+                LOG.info(
+                    "xAI script quota/usage response headers after call: %s",
+                    json.dumps(response_quota_headers, sort_keys=True),
+                )
+                self._last_xai_script_quota_headers = response_quota_headers
             duration = time.monotonic() - started
             log_level = logging.INFO if status == "succeeded" else logging.WARNING
             LOG.log(
                 log_level,
-                "Script provider generation %s model=%s duration_seconds=%.2f "
-                "prompt_tokens=%s completion_tokens=%s total_tokens=%s",
+                "Script provider generation %s provider=%s model=%s "
+                "duration_seconds=%.2f prompt_tokens=%s completion_tokens=%s "
+                "total_tokens=%s cost_in_usd_ticks=%s",
                 status,
+                provider_label,
                 provider.model,
                 duration,
-                usage.get("prompt_tokens", "unknown"),
-                usage.get("completion_tokens", "unknown"),
+                usage.get("prompt_tokens", usage.get("input_tokens", "unknown")),
+                usage.get("completion_tokens", usage.get("output_tokens", "unknown")),
                 usage.get("total_tokens", "unknown"),
+                usage.get("cost_in_usd_ticks", "unknown"),
+            )
+
+    def _write_script_chat(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+    ) -> tuple[Any, dict[str, Any]]:
+        provider = self.config.script_provider
+        if provider.provider != "grok_oauth":
+            return self._script_chat(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+            )
+        if self.grok_credentials is None:
+            raise RuntimeError("Grok OAuth script credentials were not resolved")
+        grok_provider = ScriptProviderConfig(
+            provider="grok_oauth",
+            base_url=self.grok_credentials.base_url,
+            model=DEFAULT_GROK_SCRIPT_MODEL,
+            timeout_seconds=provider.timeout_seconds,
+        )
+        try:
+            return self._script_chat(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                provider_override=grok_provider,
+                bearer=self.grok_credentials.bearer,
+                provider_label="grok_oauth",
+                log_xai_quota=True,
+            )
+        except ScriptProviderHTTPError as exc:
+            if exc.status_code not in {403, 429}:
+                raise
+            LOG.warning(
+                "xAI Grok OAuth write_script returned HTTP %s; falling back "
+                "to local Qwen provider model=%s base_url=%s",
+                exc.status_code,
+                provider.model,
+                provider.base_url,
+            )
+            return self._script_chat(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                provider_label="local_qwen_fallback",
             )
 
     def fetch_story(self) -> None:
@@ -1827,15 +1970,21 @@ visually without on-screen text.
             ),
         }[configured_video_mode]
         target_seconds = self.config.target_duration_seconds
-        shot_count = target_shot_count(target_seconds)
+        narration_seconds_min = self.config.narration_seconds_min
+        narration_seconds_max = self.config.narration_seconds_max
+        narration_range = f"{narration_seconds_min:g}-{narration_seconds_max:g}"
+        shot_count = target_shot_count(
+            target_seconds,
+            narration_seconds_min,
+            narration_seconds_max,
+        )
         average_seconds = target_seconds / shot_count
         system_prompt = (
             "You write original, accurate, fast-paced evergreen explainer "
             "scripts for vertical video. Write narration for the ear, not the "
             "page. Return only valid JSON. Stay within the supplied topic "
             "brief and do not invent sources, quotes, statistics, or timely "
-            "claims. Each shot must have exactly one simple camera move as "
-            "its motion instruction."
+            "claims. Follow the supplied motion direction for every shot."
         )
         user_prompt = f"""
 Turn this topic brief into an original evergreen YouTube explainer targeting
@@ -1848,6 +1997,9 @@ TOPIC BRIEF:
 STYLE BLOCK (copy this exact string at the beginning of every frame prompt):
 {json.dumps(self.config.style_block, ensure_ascii=False)}
 
+MOTION BLOCK (apply this direction to every motion_instruction):
+{json.dumps(self.config.motion_block, ensure_ascii=False)}
+
 NARRATION STYLE (apply this free-text direction to the spoken voice):
 {json.dumps(self.config.narration_style, ensure_ascii=False)}
 
@@ -1857,8 +2009,8 @@ Return exactly:
   "description": "Two short paragraphs describing the explainer",
   "shots": [
     {{
-      "voiceover_text": "spoken narration for this roughly 4-6 second shot",
-      "motion_instruction": "one camera move, for example: slow push-in",
+      "voiceover_text": "spoken narration for this roughly {narration_range} second shot",
+      "motion_instruction": "motion following the MOTION BLOCK",
       "video_mode": "i2v or flf",
       "first_frame_prompt": "STYLE BLOCK followed by a detailed 9:16 opening frame prompt",
       "last_frame_prompt": "STYLE BLOCK followed by a detailed ending frame prompt, or null for i2v"
@@ -1869,12 +2021,11 @@ Return exactly:
 Requirements:
 - Exactly {shot_count} shots.
 - Aim for about {average_seconds:.1f} seconds of spoken narration per shot,
-  keeping every shot in the 4-6 second range.
+  keeping every shot in the {narration_range} second range.
 - Total voiceover should sound natural in about {target_seconds:g} seconds.
 - Shot 1 hooks immediately; the middle shots build the explanation; the final
   shot lands the central insight and why it matters.
-- Exactly one short camera move per motion_instruction (for example "slow
-  push-in", "gentle pan left", or "static locked-off"); do not combine moves.
+- Follow the MOTION BLOCK exactly for each motion_instruction.
 - {mode_instruction}
 - Begin every non-null frame prompt with the STYLE BLOCK exactly as supplied.
 - No visible text, logos, watermarks, captions, or UI in image prompts.
@@ -1894,7 +2045,7 @@ Requirements:
 - Before returning JSON, reread all narration as if speaking it aloud. Rewrite
   any sentence a person wouldn't say to a friend.
 """.strip()
-        script, _ = self._script_chat(
+        script, _ = self._write_script_chat(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
         )
@@ -2519,7 +2670,7 @@ Requirements:
         measured_seconds: float,
     ) -> str:
         target_seconds = min(
-            NARRATION_SECONDS_MAX,
+            self.config.narration_seconds_max,
             self.config.max_clip_seconds - self.config.clip_padding,
         )
         max_words = max(4, math.floor(target_seconds * 2.3))
@@ -2558,9 +2709,9 @@ Return exactly:
         state = self._shot_audio_state()
         entries = state["shots"]
         desired_seconds = min(
-            NARRATION_SECONDS_MAX,
+            self.config.narration_seconds_max,
             max(
-                NARRATION_SECONDS_MIN,
+                self.config.narration_seconds_min,
                 self.config.target_duration_seconds / len(shots),
             ),
         )
@@ -3764,7 +3915,11 @@ def configure_run(
         stored_frames = stored.get("frames_provider")
         stored_video = stored.get("video_provider")
         legacy_visuals = stored.get("visuals")
-        if stored_frames is None and stored_video is None and legacy_visuals in VISUAL_BACKENDS:
+        if (
+            stored_frames is None
+            and stored_video is None
+            and legacy_visuals in VISUAL_BACKENDS
+        ):
             selected = resolve_visual_providers(
                 run_config,
                 visuals=str(legacy_visuals),
@@ -3823,15 +3978,16 @@ def validate_startup(
             "XAI_API_KEY is required for video_provider=xai_key; refusing to "
             "start before any API spend or queue activity."
         )
-    if "grok" not in {providers.frames, providers.video}:
+    if provider.provider != "grok_oauth" and "grok" not in {
+        providers.frames,
+        providers.video,
+    }:
         return None
     try:
-        credentials = resolve_xai_credentials(
-            api_key_env_value=settings.xai_api_key
-        )
+        credentials = resolve_xai_credentials(api_key_env_value=settings.xai_api_key)
     except XAIAuthError as exc:
         raise RuntimeError(
-            f"Grok Imagine credential pre-flight failed: {exc} Refusing to "
+            f"Grok credential pre-flight failed: {exc} Refusing to "
             "start before any API spend or queue activity."
         ) from exc
     if providers.video == "grok":
@@ -3842,8 +3998,7 @@ def validate_startup(
         ]
         if missing_tools:
             raise RuntimeError(
-                "Grok video duration conformance requires: "
-                + ", ".join(missing_tools)
+                "Grok video duration conformance requires: " + ", ".join(missing_tools)
             )
     return credentials
 
@@ -3953,10 +4108,29 @@ def _frame_gate_summary(run: Mapping[str, Any]) -> dict[str, Any]:
             if isinstance(preset, Mapping)
             else PipelineConfig().target_duration_seconds
         )
+        narration_seconds_min = (
+            preset.get("narration_seconds_min", PipelineConfig().narration_seconds_min)
+            if isinstance(preset, Mapping)
+            else PipelineConfig().narration_seconds_min
+        )
+        narration_seconds_max = (
+            preset.get("narration_seconds_max", PipelineConfig().narration_seconds_max)
+            if isinstance(preset, Mapping)
+            else PipelineConfig().narration_seconds_max
+        )
         try:
-            shot_count = target_shot_count(float(target_seconds))
+            shot_count = target_shot_count(
+                float(target_seconds),
+                float(narration_seconds_min),
+                float(narration_seconds_max),
+            )
         except (TypeError, ValueError):
-            shot_count = target_shot_count(PipelineConfig().target_duration_seconds)
+            defaults = PipelineConfig()
+            shot_count = target_shot_count(
+                defaults.target_duration_seconds,
+                defaults.narration_seconds_min,
+                defaults.narration_seconds_max,
+            )
     grouped: dict[int, list[dict[str, Any]]] = {
         shot_index: [] for shot_index in range(1, shot_count + 1)
     }
@@ -4153,9 +4327,7 @@ def main(argv: list[str] | None = None) -> int:
     grok_credentials: XAICredentials | None = None
     if args.new:
         try:
-            grok_credentials = validate_startup(
-                settings, requested_providers, preset
-            )
+            grok_credentials = validate_startup(settings, requested_providers, preset)
         except (RuntimeError, ValueError) as exc:
             LOG.error("%s", exc)
             return 2
